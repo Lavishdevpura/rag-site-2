@@ -1,0 +1,80 @@
+# ── LLM / LangChain ──────────────────────────────────────────────────────────
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-openai>=0.2.0
+langchain-anthropic>=0.2.0
+langchain-core>=0.3.0
+langchain-text-splitters>=0.3.0
+openai>=1.40.0
+anthropic>=0.39.0
+
+# ── Vector Store ──────────────────────────────────────────────────────────────
+# TurboVec replaces ChromaDB — 4-bit quantization, no GPU, ARM-compatible
+turbovec>=0.2.0
+
+# ── Embeddings & Reranking ────────────────────────────────────────────────────
+sentence-transformers>=3.0.0
+numpy>=1.26.0
+rank-bm25>=0.2.2
+
+# ── Document Extraction ───────────────────────────────────────────────────────
+docling>=2.5.0
+pdfplumber>=0.11.4
+pypdf>=5.0.0
+python-docx>=1.1.0
+python-pptx>=0.6.23
+openpyxl>=3.1.2
+pandas>=2.2.0
+
+# ── Web / URL Extraction ──────────────────────────────────────────────────────
+trafilatura>=2.0.0
+beautifulsoup4>=4.12.0
+lxml>=5.3.0
+readability-lxml>=0.8.1
+newspaper3k>=0.2.8
+youtube-transcript-api>=0.6.0
+requests>=2.32.0
+
+# ── REST API ──────────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.12
+aiohttp>=3.10.0
+
+# ── WebSocket & File Type Detection ──────────────────────────────────────────
+websockets>=13.0
+python-magic>=0.4.27
+
+# ── Authentication ────────────────────────────────────────────────────────────
+passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.3.0
+
+# ── Session / conversation store (redis_client.py) ────────────────────────────
+redis>=5.0.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+rapidfuzz>=3.10.0
+python-dotenv>=1.0.0
+
+# ── Chunking (sentence_semantic_chunker.py) ────────────────────────────────────
+tiktoken>=0.8.0
+
+# ── Voice Transcription ───────────────────────────────────────────────────────
+openai-whisper>=20240930
+
+# ── YouTube Audio Download ────────────────────────────────────────────────────
+yt-dlp>=2024.12.0
+ffmpeg-python>=0.2.0
+
+# ── Math & Async ──────────────────────────────────────────────────────────────
+# numpy is listed above; aiohttp is listed above
+
+# ── Natural-language-to-SQL (sql_rag/) ─────────────────────────────────────────
+# Dormant until ENABLE_SQL_RAG=true and SQL_DATABASE_URL are both set (see
+# sql_rag/config.py). sqlalchemy is engine-agnostic; add the driver for
+# whatever the real database turns out to be once known, e.g.:
+#   pymysql            (MySQL)
+#   psycopg2-binary     (PostgreSQL)
+#   pyodbc              (SQL Server)
+sqlalchemy>=2.0.0
+sqlglot>=25.0.0

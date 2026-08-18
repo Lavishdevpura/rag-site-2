@@ -1,0 +1,105 @@
+# One service: api — the RAG chat API → port 8521
+#
+# Forked from Layla (InsureHub-RAG) 2026-08-17: no eval/RAGAS tuning
+# service in this fork (dev tooling, not product) — just the chat API and
+# its Redis conversation-history store.
+#
+# Explicit project `name` below matters: this fork and rag_site_1's
+# backend/ directory share the literal folder name "backend", which is
+# what Compose derives its default project name from — without pinning
+# this, both forks' unqualified volumes (hf_cache, whisper_cache,
+# redis_data) would resolve to the SAME "backend_*" volume names and
+# silently share/collide state. Pinning a unique name per fork scopes
+# every volume/network/container to that project.
+name: rag_site2
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      # CPU by default. Overlay docker-compose.gpu.yml on a host with an
+      # NVIDIA GPU to build against CUDA torch and get GPU access instead
+      # (see that file for usage) — do not set this directly in .env.
+      TORCH_DEVICE: ${TORCH_DEVICE:-cpu}
+  shm_size: '2gb'
+  deploy:
+    resources:
+      limits:
+        memory: 4G
+      reservations:
+        memory: 1G
+  env_file:
+    - .env
+  environment:
+    # Pins the embedder/reranker (turbovec_store.py's _resolve_model_device)
+    # to CPU explicitly instead of leaving it to CUDA auto-detection.
+    # Deliberate: those two model loads have NO try/except fallback, so on a
+    # host where CUDA is *detected but not actually usable* (GPU visible to
+    # the daemon but not granted to the container, driver/toolkit mismatch),
+    # the load raises and the service fails to start. An explicit "cpu"
+    # short-circuits detection entirely and is a no-op on a CPU-only host.
+    # To move to GPU: build with the docker-compose.gpu.yml overlay AND set
+    # MODEL_DEVICE=cuda (or drop it to re-enable auto-detect) once the GPU is
+    # confirmed reachable — `docker run --rm --gpus all nvidia/cuda:...
+    # nvidia-smi` is the check.
+    MODEL_DEVICE: ${MODEL_DEVICE:-cpu}
+    # redis_client.py's default already matches this ("redis" resolves via
+    # Docker DNS to the service below on the shared compose network) — set
+    # explicitly here anyway so it's visible without reading the code.
+    REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  volumes:
+    - rag_site2_data:/root/.insurehub
+    - rag_site2_tmp:/root/.insurehub_tmp
+    - hf_cache:/root/.cache/huggingface
+    - whisper_cache:/root/.cache/whisper
+  restart: unless-stopped
+
+services:
+
+  # ── Session/conversation store — appendonly persistence so conversation
+  # history survives a redis restart.
+  redis:
+    image: redis:7-alpine
+    container_name: rag_site2_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── RAG chat API (/ask-stream, /upload, etc.) ────────────────────────────
+  api:
+    <<: *common
+    container_name: rag_site2_api
+    working_dir: /app/app
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8521", "--ws-per-message-deflate", "False"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8521:8521"
+    volumes:
+      - rag_site2_data:/root/.insurehub
+      - rag_site2_tmp:/root/.insurehub_tmp
+      - hf_cache:/root/.cache/huggingface
+      - whisper_cache:/root/.cache/whisper
+      - ./app:/app/app
+      - ../frontend/dist:/app/frontend_dist
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8521/health"]
+      interval: 30s
+      timeout: 30s
+      start_period: 180s
+      retries: 3
+
+volumes:
+  rag_site2_data:
+  rag_site2_tmp:
+  hf_cache:
+  whisper_cache:
+  redis_data:

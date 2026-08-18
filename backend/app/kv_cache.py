@@ -1,0 +1,454 @@
+"""
+Redis-persisted KV cache for RAG query results with semantic similarity lookup.
+
+Two lookup modes
+----------------
+1. Exact  — SHA-256 of (query + config flags + sorted source list).
+            Instant O(1) hit for identical re-queries.
+2. Semantic — cosine similarity between the incoming query embedding and all
+              stored query embeddings.  Returns the best match above a
+              configurable threshold (default 0.94).  Catches rephrased
+              queries that mean the same thing ("What is home insurance?"
+              vs "What does home insurance cover?" scored 0.896 live —
+              genuinely the same intent, different wording, though below
+              even this threshold; direct serving is deliberately reserved
+              for near-identical phrasing only).
+
+Cache key still includes the sorted source list so adding a new document
+automatically invalidates all cached answers for the same query.
+
+The similarity search itself stays in-process numpy (self._emb_matrix, an
+(N, D) matrix of every live entry's query embedding, matmul'd against the
+incoming query on every semantic_get/semantic_get_related call) rather than
+moving to Redis-side vector search (RediSearch) — at this cache's real size
+(max_entries defaults to 500, one 768-dim float32 vector each) an in-memory
+matmul is already sub-millisecond, and RediSearch would mean a different
+Redis image/module plus a whole new query API for zero measurable benefit
+at this scale. Redis here is PERSISTENCE only: self._data/self._emb_matrix
+are an in-memory mirror hydrated from Redis at startup (_load) and kept in
+sync on every write, same "in-memory read/compute path + Redis persists
+each individual write" split already used for agent_hub.py's ChatSession —
+each put() now touches exactly the one key that changed instead of
+rewriting every cached entry (including every entry's 768-float embedding
+list) to one JSON file on every single cache write.
+
+TTL: configurable, default 3600 s (1 hour) — set as each key's native Redis
+TTL (a real backstop: an entry can't outlive it even if this process never
+restarts) AND still re-checked in-process on every read exactly as before,
+since Redis expiring a key doesn't retroactively evict it from the
+in-memory mirror the moment it happens.
+Eviction: lazy on read + LRU when max_entries is reached.
+"""
+import hashlib
+import json
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import redis as _redis_sync
+
+logger = logging.getLogger(__name__)
+
+_KEY_PREFIX = "kv:"
+
+_CACHE_VERSION = 2          # bumped because entry schema changed (added query_embedding)
+# Raised 0.92 -> 0.94 (2026-07-13, explicit user request after a stale
+# templated answer got replayed for a semantically-related-but-distinct
+# question). Live measurement showed genuinely different questions on the
+# same topic ("What is life insurance?" vs "What are the benefits of the
+# life insurance?") scoring 0.75-0.78 — well clear of even the old
+# threshold — so this alone wasn't the direct-hit mechanism responsible;
+# see semantic_get_related's lower_threshold below for the actual fix.
+# Raised anyway for a wider safety margin on direct serving specifically,
+# since a direct hit skips generation entirely and shows the user the
+# OLD answer verbatim — that path should require very high confidence.
+_SEMANTIC_THRESHOLD_DEFAULT = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.94"))
+
+
+class QueryKVCache:
+    """
+    Redis-persisted semantic KV cache — see module docstring for why the
+    similarity search itself stays in-process numpy rather than moving to
+    Redis-side vector search.
+
+    Parameters
+    ----------
+    redis_url     : Redis connection URL (redis://host:port/db).
+    ttl_seconds   : entry lifetime (default 3600 s).
+    max_entries   : LRU eviction threshold (default 500).
+    sem_threshold : cosine similarity threshold for semantic hits (0–1).
+    """
+
+    def __init__(
+        self,
+        redis_url: str,
+        ttl_seconds: int = 3600,
+        max_entries: int = 500,
+        sem_threshold: float = _SEMANTIC_THRESHOLD_DEFAULT,
+    ):
+        # Synchronous client, not redis.asyncio — every call site in
+        # multi_source_rag.py/rag.py calls get()/put()/semantic_get() etc.
+        # as plain sync calls today (this class predates any async
+        # persistence in this codebase), and threading async through
+        # RAGPipeline's construction + every ask_stream() cache touchpoint
+        # would be a much bigger refactor for no real benefit — a local
+        # Redis round-trip is sub-millisecond, same order of magnitude as
+        # the blocking file I/O it replaces, which this same code path
+        # already did synchronously with no complaint.
+        self._redis = _redis_sync.from_url(redis_url, decode_responses=True)
+        self._ttl  = ttl_seconds
+        self._max  = max_entries
+        self._sem_threshold = sem_threshold
+
+        # key -> {value, ts, hits, ts_last_hit, query_text, query_embedding}
+        self._data: Dict[str, Dict] = {}
+
+        # In-memory embedding matrix for fast semantic search (rebuilt lazily)
+        self._emb_matrix: Optional[np.ndarray] = None   # shape (N, D)
+        self._emb_keys:   List[str] = []                # parallel list of keys
+        self._emb_dirty = True                          # rebuild needed flag
+
+        self._load()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Key construction
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def make_key(
+        query: str,
+        top_k: int,
+        use_hybrid: bool,
+        use_reranker: bool,
+        generate_answer: bool,
+        run_ragas: bool,
+        sources: List[str],
+        detailed: bool = False,
+        has_example: bool = False,
+        has_simple: bool = False,
+    ) -> str:
+        """Deterministic exact-match key.  Changing any parameter gives a new key."""
+        payload = json.dumps(
+            {
+                "q": query.strip().lower(),
+                "k": top_k,
+                "h": use_hybrid,
+                "r": use_reranker,
+                "a": generate_answer,
+                "g": run_ragas,
+                "s": sorted(sources),
+                "d": detailed,
+                "ex": has_example,
+                "si": has_simple,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public API — exact
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return cached value or None if missing / expired."""
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        if time.time() - entry["ts"] > self._ttl:
+            del self._data[key]
+            self._emb_dirty = True
+            return None
+        entry["hits"] += 1
+        entry["ts_last_hit"] = time.time()
+        return entry["value"]
+
+    def put(
+        self,
+        key: str,
+        value: Dict[str, Any],
+        query_embedding: Optional[np.ndarray] = None,
+        query_text: str = "",
+    ) -> None:
+        """Store *value* under *key*, optionally with an embedding for semantic lookup."""
+        self._evict_if_needed()
+        entry: Dict[str, Any] = {
+            "value":       value,
+            "ts":          time.time(),
+            "hits":        0,
+            "ts_last_hit": time.time(),
+            "query_text":  query_text,
+        }
+        if query_embedding is not None:
+            entry["query_embedding"] = query_embedding.tolist()
+        self._data[key] = entry
+        self._emb_dirty = True
+        self._save_entry(key, entry)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public API — semantic
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def semantic_get(
+        self,
+        query_embedding: np.ndarray,
+        threshold: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find the cached result whose stored query embedding is most similar
+        to *query_embedding* (cosine similarity).
+
+        Returns the cached value if best similarity ≥ threshold, else None.
+        Skips entries that have no stored embedding or are expired.
+        """
+        if not self._data:
+            return None
+
+        thr = threshold if threshold is not None else self._sem_threshold
+        self._rebuild_emb_matrix()
+
+        if self._emb_matrix is None or self._emb_matrix.shape[0] == 0:
+            return None
+
+        # query_embedding must be unit-normalised (BGE always returns normalised)
+        qe = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
+        sims: np.ndarray = self._emb_matrix @ qe
+
+        best_idx = int(np.argmax(sims))
+        best_sim = float(sims[best_idx])
+
+        if best_sim < thr:
+            return None
+
+        best_key = self._emb_keys[best_idx]
+        logger.info(
+            "[KVCache] semantic hit  sim=%.3f  cached_query=%r",
+            best_sim,
+            self._data.get(best_key, {}).get("query_text", "")[:80],
+        )
+        return self.get(best_key)   # goes through TTL check + hit counter
+
+    def semantic_get_related(
+        self,
+        query_embedding: np.ndarray,
+        lower_threshold: float = 0.80,
+        upper_threshold: float = 0.94,
+        top_k: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return up to top_k cached entries whose similarity to query_embedding
+        falls in [lower_threshold, upper_threshold).
+
+        Entries at or above upper_threshold are reserved for semantic_get (direct
+        serving).  This method only collects entries that are *related but not
+        identical* — used as supplementary context for the LLM rather than as
+        direct answers.  Returns a list of (value_dict, query_text) pairs sorted
+        by similarity descending.
+
+        lower_threshold raised 0.60 -> 0.80 (2026-07-13) — this, not the
+        direct-hit threshold, was the actual mechanism behind a real
+        complaint: a stale, oddly-templated cached answer ("proposal
+        form... honestly, this can seem a bit complex...") got pulled in
+        as "related" context for several genuinely different follow-up
+        questions on the same broad topic, and the model's fresh
+        generation ended up imitating that old answer's phrasing almost
+        verbatim. Measured live: "What is life insurance?" vs "What are
+        the benefits of the life insurance?" — a clearly different
+        question, same topic — scored 0.75-0.78, comfortably inside the
+        old [0.60, 0.92) window. 0.80 excludes that measured case with a
+        margin while still allowing genuinely close paraphrases through
+        as supplementary context.
+        """
+        if not self._data:
+            return []
+        self._rebuild_emb_matrix()
+        if self._emb_matrix is None or self._emb_matrix.shape[0] == 0:
+            return []
+
+        qe = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
+        sims: np.ndarray = self._emb_matrix @ qe
+
+        now = time.time()
+        results = []
+        for idx in np.argsort(sims)[::-1]:
+            sim = float(sims[idx])
+            if sim >= upper_threshold:
+                continue        # leave these for semantic_get (direct serve)
+            if sim < lower_threshold:
+                break           # sorted descending — nothing below this matters
+            key = self._emb_keys[idx]
+            entry = self._data.get(key)
+            if entry is None or now - entry["ts"] > self._ttl:
+                continue
+            value = entry["value"]
+            results.append({
+                **value,
+                "query_text": entry.get("query_text", ""),
+                "_sim": sim,
+            })
+            if len(results) >= top_k:
+                break
+
+        if results:
+            logger.info(
+                "[KVCache] semantic_related: %d entries in [%.2f, %.2f) for query",
+                len(results), lower_threshold, upper_threshold,
+            )
+        return results
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public API — maintenance
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def invalidate(self, key: str) -> None:
+        self._data.pop(key, None)
+        self._emb_dirty = True
+        self._delete_entries([key])
+
+    def flush(self) -> int:
+        now = time.time()
+        before = len(self._data)
+        expired_keys = [k for k, v in self._data.items() if now - v["ts"] > self._ttl]
+        self._data = {k: v for k, v in self._data.items() if now - v["ts"] <= self._ttl}
+        removed = before - len(self._data)
+        if removed:
+            self._emb_dirty = True
+            self._delete_entries(expired_keys)
+        return removed
+
+    def clear(self) -> None:
+        keys = list(self._data.keys())
+        self._data.clear()
+        self._emb_matrix = None
+        self._emb_keys   = []
+        self._emb_dirty  = False
+        self._delete_entries(keys)
+
+    def stats(self) -> Dict[str, Any]:
+        now = time.time()
+        live    = sum(1 for v in self._data.values() if now - v["ts"] <= self._ttl)
+        expired = len(self._data) - live
+        total_hits = sum(v.get("hits", 0) for v in self._data.values())
+        sem_entries = sum(1 for v in self._data.values() if "query_embedding" in v)
+        return {
+            "total_entries":    len(self._data),
+            "live_entries":     live,
+            "expired_entries":  expired,
+            "semantic_entries": sem_entries,
+            "total_hits":       total_hits,
+            "ttl_seconds":      self._ttl,
+            "max_entries":      self._max,
+            "sem_threshold":    self._sem_threshold,
+            "backend":          "redis",
+        }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Internal
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _rebuild_emb_matrix(self) -> None:
+        if not self._emb_dirty:
+            return
+        now = time.time()
+        keys, vecs = [], []
+        for k, entry in self._data.items():
+            if now - entry["ts"] > self._ttl:
+                continue
+            emb = entry.get("query_embedding")
+            if emb is None:
+                continue
+            keys.append(k)
+            vecs.append(emb)
+
+        if vecs:
+            mat = np.array(vecs, dtype=np.float32)
+            norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-10
+            self._emb_matrix = mat / norms
+        else:
+            self._emb_matrix = None
+        self._emb_keys  = keys
+        self._emb_dirty = False
+
+    def _evict_if_needed(self) -> None:
+        if len(self._data) < self._max:
+            return
+        now = time.time()
+        expired = [k for k, v in self._data.items() if now - v["ts"] > self._ttl]
+        for k in expired:
+            del self._data[k]
+        if expired:
+            self._delete_entries(expired)
+        if len(self._data) < self._max:
+            self._emb_dirty = True
+            return
+        oldest = min(self._data, key=lambda k: self._data[k].get("ts_last_hit", self._data[k]["ts"]))
+        del self._data[oldest]
+        self._delete_entries([oldest])
+        self._emb_dirty = True
+
+    def _redis_key(self, key: str) -> str:
+        return f"{_KEY_PREFIX}{key}"
+
+    def _save_entry(self, key: str, entry: Dict[str, Any]) -> None:
+        try:
+            payload = dict(entry)
+            payload["_v"] = _CACHE_VERSION
+            self._redis.set(self._redis_key(key), json.dumps(payload), ex=self._ttl)
+        except Exception as exc:
+            logger.warning("[KVCache] Redis save failed for key=%s...: %s", key[:12], exc)
+
+    def _delete_entries(self, keys: List[str]) -> None:
+        if not keys:
+            return
+        try:
+            self._redis.delete(*[self._redis_key(k) for k in keys])
+        except Exception as exc:
+            logger.warning("[KVCache] Redis delete failed for %d key(s): %s", len(keys), exc)
+
+    def _load(self) -> None:
+        """Hydrate self._data from every kv:* key in Redis at startup —
+        Redis's own TTL means most staleness is already handled server-side
+        (an entry whose TTL fired simply won't exist to SCAN), but the
+        version + ts checks below stay as a backstop the exact same way
+        the old file-based _load() checked schema version and pruned
+        expired entries on load, in case TTL and ttl_seconds have drifted
+        (e.g. this process's KV_CACHE_TTL was shortened since the entry
+        was written, so Redis hasn't expired it yet but this process
+        should still treat it as stale)."""
+        try:
+            keys = list(self._redis.scan_iter(match=f"{_KEY_PREFIX}*"))
+        except Exception as exc:
+            logger.warning("[KVCache] Redis scan failed (%s) — starting empty", exc)
+            return
+        if not keys:
+            return
+        try:
+            raw_values = self._redis.mget(keys)
+        except Exception as exc:
+            logger.warning("[KVCache] Redis mget failed (%s) — starting empty", exc)
+            return
+
+        now = time.time()
+        loaded, stale = 0, []
+        for redis_key, raw in zip(keys, raw_values):
+            if raw is None:
+                continue
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if entry.pop("_v", None) != _CACHE_VERSION:
+                stale.append(redis_key[len(_KEY_PREFIX):])
+                continue
+            if now - entry.get("ts", 0) > self._ttl:
+                stale.append(redis_key[len(_KEY_PREFIX):])
+                continue
+            self._data[redis_key[len(_KEY_PREFIX):]] = entry
+            loaded += 1
+
+        self._emb_dirty = True
+        logger.info("[KVCache] loaded %d entries from Redis", loaded)
+        if stale:
+            self._delete_entries(stale)
+            logger.info("[KVCache] pruned %d stale entry(ies) on startup", len(stale))

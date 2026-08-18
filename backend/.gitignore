@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# Vector store data (can be rebuilt)
+app/chroma_db/
+app/turbovec_data/
+app/state/
+
+# sql_rag test/local databases (never real business data — see
+# sql_rag/config.py, SQL_DATABASE_URL points elsewhere in production)
+app/*.db
+
+# Temp / uploads
+app/video/
+
+# Environment
+.env
+
+# Docker volumes (managed by Docker)
+*.log
+
+# Claude Code internal files
+.claude/
