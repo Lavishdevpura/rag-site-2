@@ -47,15 +47,19 @@ ENABLE_METADATA_FILTERING = os.getenv("ENABLE_METADATA_FILTERING", "false").stri
 # Longer / more specific patterns are listed first so they get hit before short
 # ones (matters for the hit-count approach).
 
-_INSURER_PATTERNS: dict[str, list[str]] = {
-    "RAK":     ["rak insurance", "rak national", "rak travel", "rak"],
-    "AIG":     ["american international group", "aig"],
-    "GIG":     ["gulf insurance group", "gulf insurance", "gig"],
-    "LIVA":    ["liva insurance", "liva"],
-    "AXA":     ["axa insurance", "axa"],
-    "ZURICH":  ["zurich insurance", "zurich"],
-    "ALLIANZ": ["allianz insurance", "allianz"],
-}
+# Left empty for NexInsure (India/IRDAI, 2026-08-18) — the previous entries
+# were Gulf-market insurers (RAK, AIG, GIG, LIVA, AXA, Zurich, Allianz) from
+# Layla's original domain, irrelevant here and actively harmful once left
+# in: _count_hits() below does a bare substring count with no word
+# boundaries, so short bare-word fallback entries like "aig" or "rak" match
+# inside ordinary English words ("again" contains "aig") and Indian
+# government/institutional text confidently mislabeled itself with a
+# random foreign insurer. NexInsure hasn't specified which carriers it
+# actually places business with yet (an open business choice per the
+# source doc, not something to guess) — populate with real Indian carrier
+# names once known, and keep multi-word entries first / avoid bare
+# 3-4 letter fallbacks to avoid repeating this same substring-collision bug.
+_INSURER_PATTERNS: dict[str, list[str]] = {}
 
 _POLICY_PATTERNS: dict[str, list[str]] = {
     # Patterns are ordered most-specific → least-specific within each type.
@@ -67,7 +71,8 @@ _POLICY_PATTERNS: dict[str, list[str]] = {
     "health":            ["health insurance", "medical insurance", "hospitalisation",
                           "hospitalization", "medical expense", "clinical",
                           "group health", "mediclaim", "critical illness",
-                          "cashless treatment", "pre-existing disease"],
+                          "cashless treatment", "pre-existing disease",
+                          "group mediclaim", "group health insurance"],
     "life":              ["life insurance", "term life", "whole life",
                           "accidental death benefit", "death benefit",
                           "life assurance", "sum assured", "endowment plan",
@@ -76,7 +81,9 @@ _POLICY_PATTERNS: dict[str, list[str]] = {
     "motor":             ["motor insurance", "vehicle insurance", "car insurance",
                           "auto insurance", "motor vehicle", "comprehensive motor",
                           "third party motor", "own damage", "ncb", "no claim bonus",
-                          "road accident", "traffic accident"],
+                          "road accident", "traffic accident",
+                          "motor fleet", "fleet insurance", "commercial vehicle insurance",
+                          "goods carrying vehicle", "indian motor tariff"],
     "home":              ["home insurance", "property insurance", "building insurance",
                           "contents insurance", "household insurance",
                           "houseowners policy", "householders policy"],
@@ -86,15 +93,19 @@ _POLICY_PATTERNS: dict[str, list[str]] = {
                           "group personal accident"],
     "fire":              ["fire insurance", "fire policy", "fire damage",
                           "standard fire", "special perils", "fire and allied perils",
-                          "fire brigade", "consequential loss"],
+                          "fire brigade", "consequential loss",
+                          "bharat sookshma udyam suraksha", "bharat laghu udyam suraksha",
+                          "sme fire", "standard fire and special perils", "sfsp"],
     "marine":            ["marine insurance", "marine cargo", "marine hull",
                           "cargo insurance", "shipping insurance",
                           "inland transit", "import cargo", "export cargo",
-                          "bill of lading", "marine policy", "transit insurance"],
+                          "bill of lading", "marine policy", "transit insurance",
+                          "institute cargo clauses", "marine cargo transit"],
     "liability":         ["liability insurance", "public liability", "product liability",
                           "professional indemnity", "errors and omissions",
                           "directors and officers", "d&o insurance",
-                          "employer liability", "third party liability"],
+                          "employer liability", "third party liability",
+                          "commercial general liability", "cgl", "general liability"],
     "commercial":        ["commercial insurance", "business insurance",
                           "trade insurance", "commercial property",
                           "business interruption", "shop insurance",
@@ -712,10 +723,14 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "motor vehicle", "comprehensive motor", "third party liability",
             "own damage", "road accident", "traffic", "driving", "bike insurance",
             "two-wheeler", "automobile", "collision", "fender bender",
+            "motor fleet", "fleet insurance", "commercial vehicle insurance",
+            "goods carrying vehicle", "indian motor tariff",
         ],
         "regex": [
             r"\bcar insurance\b", r"\bmotor insurance\b", r"\bvehicle insurance\b",
             r"\bauto insurance\b", r"\bmotor vehicle\b", r"\bcomprehensive motor\b",
+            r"\bmotor fleet\b", r"\bfleet insurance\b", r"\bcommercial vehicle insurance\b",
+            r"\bgoods carrying vehicle\b", r"\bindian motor tariff\b",
             # Narrowed from bare \bthird.?party\b (2026-07-16) — "third party"
             # alone is a general legal/insurance concept spanning liability,
             # professional indemnity, and general insurance principles, not
@@ -743,12 +758,14 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "medical expense", "clinical", "OPD", "IPD", "cashless treatment",
             "doctor", "surgery", "medicine", "treatment", "illness", "disease",
             "pre-existing", "maternity", "dental", "vision", "pharmacy",
+            "group health insurance", "group mediclaim", "group health",
         ],
         "regex": [
             r"\bhealth insurance\b", r"\bmedical insurance\b", r"\bhospitali[sz]ation\b",
             r"\bhospital\b", r"\bmedical expense\b", r"\bclinical\b",
             r"\bdoctor\b", r"\bsurgery\b", r"\billness\b", r"\btreatment\b",
             r"\bpre.?existing\b", r"\bmaternity\b",
+            r"\bgroup health insurance\b", r"\bgroup mediclaim\b", r"\bgroup health\b",
             # Bare \bhealth\b / \bmedical\b were tried and reverted the same
             # day (2026-07-16): fixed a heading-only edge case ("THIRD PARTY
             # ADMINISTRATORS-HEALTH") but caused a worse regression in body
@@ -870,10 +887,14 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "fire insurance", "fire policy", "fire damage", "standard fire",
             "special perils", "fire and allied perils", "consequential loss",
             "fire brigade", "fire loss", "burning",
+            "bharat sookshma udyam suraksha", "bharat laghu udyam suraksha",
+            "sme fire", "standard fire and special perils", "sfsp",
         ],
         "regex": [
             r"\bfire insurance\b", r"\bfire policy\b", r"\bfire damage\b",
             r"\bstandard fire\b", r"\bspecial perils\b", r"\bconsequential loss\b",
+            r"\bbharat sookshma udyam suraksha\b", r"\bbharat laghu udyam suraksha\b",
+            r"\bsme fire\b", r"\bstandard fire and special perils\b", r"\bsfsp\b",
         ],
     },
     "marine": {
@@ -885,6 +906,7 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "marine insurance", "marine cargo", "marine hull", "cargo insurance",
             "shipping insurance", "inland transit", "import cargo", "export cargo",
             "bill of lading", "marine policy", "goods in transit",
+            "institute cargo clauses", "marine cargo transit",
         ],
         "regex": [
             r"\bmarine insurance\b", r"\bmarine cargo\b", r"\bmarine hull\b",
@@ -915,12 +937,14 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "liability insurance", "public liability", "product liability",
             "professional indemnity", "errors and omissions", "e&o",
             "directors and officers", "d&o insurance", "employer liability",
-            "third party liability",
+            "third party liability", "commercial general liability", "cgl",
+            "general liability",
         ],
         "regex": [
             r"\bliability insurance\b", r"\bpublic liability\b", r"\bproduct liability\b",
             r"\bprofessional indemnity\b", r"\berrors and omissions\b",
             r"\bd&o insurance\b", r"\bdirectors and officers\b",
+            r"\bcommercial general liability\b", r"\bcgl\b", r"\bgeneral liability\b",
         ],
     },
     "commercial": {

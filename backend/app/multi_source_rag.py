@@ -30,20 +30,39 @@ logger = logging.getLogger(__name__)
 _LLM_BACKEND_ERRORS = (_APIConnectionError, _APITimeoutError, _APIStatusError)
 
 # ── Typo-tolerant domain vocabulary ──────────────────────────────────────────
-# Forked from Layla 2026-08-17: this used to be a hand-curated insurance-
-# domain term list for _correct_typos() to fuzzy-match against before
-# vector retrieval. Left empty until the real domain for this deployment
-# is known — an empty list makes _correct_typos() a no-op (nothing to
-# correct against) rather than silently correcting toward insurance
-# vocabulary that has nothing to do with this KB. Populate with this
-# deployment's own domain terms once known.
-_INSURANCE_VOCAB = []
+# Domain confirmed 2026-08-18 (NexInsure — India/IRDAI B2B commercial
+# lines: property & liability, group health, marine/cargo/transit,
+# motor/fleet). Populated from that scope. This list is also read by the
+# hollow-answer detector's _has_domain_word check further down this file
+# — see that check's own comment for why it treats an empty list as
+# "skip this check" rather than "no domain word found" (found live on
+# rag_site_1: a correct 11-word grounded answer about marine cargo got
+# redirected to a refusal purely because the list had nothing to match
+# against — that class of bug is now impossible whether this list ends
+# up empty or populated).
+_INSURANCE_VOCAB = [
+    "policy", "premium", "insured", "insurer", "insurance", "claim", "claims",
+    "coverage", "cover", "exclusion", "exclusions", "endorsement",
+    "underwriting", "underwriter", "proposal", "wording", "deductible",
+    "excess", "liability", "indemnity", "reinsurance", "coinsurance",
+    "uninsured", "underinsured", "assured", "peril", "perils", "hazard",
+    "subrogation", "warranty", "breach", "quote", "quoting", "rating",
+    "tariff", "sublimit", "sublimits", "arbitration", "ombudsman",
+    "irdai", "regulatory", "regulation", "circular", "gazette", "notification",
+    "motor", "vehicle", "fleet", "commercial", "goods",
+    "marine", "cargo", "transit", "shipment", "consignment", "hull",
+    "fire", "property", "sme",
+    "health", "hospitalisation", "hospitalization", "mediclaim", "group",
+    "public", "product", "professional", "director", "officer", "employer",
+    "cyber", "breach",
+]
 
 # Ordinary English words that fuzzy-match an _INSURANCE_VOCAB entry above
-# the 85 threshold but are never actually a typo of it. Empty along with
-# _INSURANCE_VOCAB above (see its own comment) — this guard is only
-# meaningful once there's a real vocab list to correct against; populate
-# alongside it once this deployment's domain terms are known.
+# the 85 threshold but are never actually a typo of it (see _correct_typos'
+# own docstring for the "company"->"copay"/"order"->"rider" precedent this
+# followed). Populated conservatively — start empty and add entries here
+# if a real collision turns up in production, the same way the two
+# existing precedents were found.
 _TYPO_CORRECTION_PROTECTED_WORDS = frozenset()
 
 
@@ -10629,7 +10648,19 @@ class MultiSourceRAG:
                     flags=_hollow_re.IGNORECASE | _hollow_re.DOTALL,
                 ).strip()
                 _word_count = len(_hollow_re.findall(r'\w+', _content_only))
-                _has_domain_word = any(term in _content_only.lower() for term in _INSURANCE_VOCAB)
+                # An empty _INSURANCE_VOCAB (domain not yet known for this
+                # deployment) must not make this MORE aggressive than a
+                # populated one. Treat "no vocab to check against" as
+                # satisfied/neutral rather than "no domain word found" —
+                # found live 2026-08-18: with the list empty this always
+                # evaluated False, so every short answer under 12 words
+                # got flagged hollow regardless of whether it was actually
+                # grounded and correct. With this fixed, an empty vocab
+                # falls back to relying on _prior_unit_dropped alone below.
+                _has_domain_word = (
+                    not _INSURANCE_VOCAB
+                    or any(term in _content_only.lower() for term in _INSURANCE_VOCAB)
+                )
                 # Gate on the ORIGINAL text being non-empty, not on content
                 # surviving the lead-in/sign-off strip — confirmed live: a
                 # reply that was NOTHING but lead-in + sign-off ("So, Let me
