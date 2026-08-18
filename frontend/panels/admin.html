@@ -51,23 +51,6 @@
   }
 
   .topbar-right { display: flex; align-items: center; gap: 16px; }
-  .user-pill {
-    font-size: 13px;
-    color: var(--muted);
-  }
-
-  .logout-btn {
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--muted);
-    padding: 6px 14px;
-    border-radius: 6px;
-    font-size: 13px;
-    font-family: inherit;
-    cursor: pointer;
-    transition: color 0.15s, border-color 0.15s;
-  }
-  .logout-btn:hover { color: var(--error); border-color: var(--error); }
 
   .main { max-width: 960px; margin: 0 auto; padding: 40px 24px; }
 
@@ -337,8 +320,6 @@
     <span class="logo-badge">Admin</span>
   </div>
   <div class="topbar-right">
-    <span class="user-pill" id="userPill"></span>
-    <button class="logout-btn" onclick="logout()">Sign out</button>
   </div>
 </div>
 
@@ -456,14 +437,6 @@
 })();
 const API = window.__BACKEND_URL;
 
-// ── Auth guard ────────────────────────────────────────────────────────────────
-let token = localStorage.getItem('insurehub_token')
-  || localStorage.getItem('insure_token')
-  || sessionStorage.getItem('insurehub_token')
-  || sessionStorage.getItem('insure_token')
-  || 'auth-disabled';
-Promise.resolve()
-    .catch(() => { /* backend may be starting — health poller will recover */ });
 // Show backend host in topbar so admin always knows which server is connected
 (function() {
   try {
@@ -508,27 +481,14 @@ function _scheduleHealthRetry() {
 }
 _pollHealth();
 
-const user = localStorage.getItem('insure_user') || 'admin';
-document.getElementById('userPill').textContent = '👤 ' + user;
-
-function authHeaders(extra = {}) {
-  return { Authorization: 'Bearer ' + token, ...extra };
-}
-
-function logout() {
-  localStorage.clear();
-  window.location.href = '/';
-}
-
 // ── Cache clear ───────────────────────────────────────────────────────────────
 async function clearCache() {
   const status = document.getElementById('cacheStatus');
   status.textContent = 'Clearing…';
   try {
     const res = await fetch(`${API}/admin/cache/clear`, {
-      method: 'POST', headers: authHeaders(),
+      method: 'POST',
     });
-    if (res.status === 401) { logout(); return; }
     if (!res.ok) throw new Error(await res.text());
     status.textContent = 'Cache cleared successfully. Next query will generate a fresh answer.';
     showToast('Answer cache cleared', 'success');
@@ -614,10 +574,8 @@ async function uploadFile(file) {
   try {
     const res = await fetch(`${API}/upload`, {
       method: 'POST',
-      headers: authHeaders(),
       body: formData,
     });
-    if (res.status === 401) { logout(); return; }
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
       throw new Error(d.detail || 'Upload failed.');
@@ -638,7 +596,7 @@ async function pollJob(job_id, fill) {
   for (let i = 0; i < 120; i++) {
     await new Promise(r => setTimeout(r, 1500));
     try {
-      const res = await fetch(`${API}/upload/${job_id}`, { headers: authHeaders() });
+      const res = await fetch(`${API}/upload/${job_id}`);
       if (!res.ok) continue;  // transient network blip — keep polling
       const job = await res.json();
       if (job.status === 'done') {
@@ -675,10 +633,9 @@ async function uploadVideo() {
   try {
     const res = await fetch(`${API}/videos`, {
       method: 'POST',
-      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
-    if (res.status === 401) { logout(); return; }
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed to add video.');
     if (data.status === 'already_exists') {
@@ -707,10 +664,9 @@ async function uploadWebpage() {
   try {
     const res = await fetch(`${API}/webpages`, {
       method: 'POST',
-      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
-    if (res.status === 401) { logout(); return; }
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Failed to add webpage.');
     showToast(`✓ Webpage added — ${data.chunks || 0} chunks indexed`, 'success');
@@ -732,7 +688,7 @@ async function loadDocs() {
   const list = document.getElementById('docList');
   list.innerHTML = '<div class="empty-state">Loading…</div>';
   try {
-    const res = await fetch(`${API}/docs`, { headers: authHeaders() });
+    const res = await fetch(`${API}/docs`);
     const data = await res.json();
     const raw = data.documents || data.items || data.results || data.docs || [];
     _allDocs = raw.map(d => {
@@ -797,9 +753,8 @@ async function removeDoc(name) {
   if (!confirm(`Remove "${name}" from knowledge base?`)) return;
   try {
     const res = await fetch(`${API}/docs/${encodeURIComponent(name)}`, {
-      method: 'DELETE', headers: authHeaders(),
+      method: 'DELETE',
     });
-    if (res.status === 401) { logout(); return; }
     showToast('Removed ' + name, 'success');
     loadDocs();
   } catch (e) {
@@ -815,7 +770,7 @@ async function loadVideos() {
   const list = document.getElementById('videoList');
   list.innerHTML = '<div class="empty-state">Loading…</div>';
   try {
-    const res = await fetch(`${API}/videos`, { headers: authHeaders() });
+    const res = await fetch(`${API}/videos`);
     const data = await res.json();
     const raw = data.videos || data.items || data.results || [];
     _allVideos = raw.map(v => {
@@ -878,9 +833,8 @@ async function removeVideo(url) {
   if (!confirm('Remove this video?')) return;
   try {
     const res = await fetch(`${API}/videos?url=${encodeURIComponent(url)}`, {
-      method: 'DELETE', headers: authHeaders(),
+      method: 'DELETE',
     });
-    if (res.status === 401) { logout(); return; }
     if (!res.ok) { showToast('Failed to remove video.', 'error'); return; }
     showToast('Video removed.', 'success');
     loadVideos();
@@ -895,7 +849,7 @@ async function loadWebpages() {
   const list = document.getElementById('webList');
   list.innerHTML = '<div class="empty-state">Loading…</div>';
   try {
-    const res = await fetch(`${API}/webpages`, { headers: authHeaders() });
+    const res = await fetch(`${API}/webpages`);
     const data = await res.json();
     const raw = data.webpages || data.items || data.results || [];
     _allWebs = raw.map(w => {
@@ -958,9 +912,8 @@ async function removeWebpage(url) {
   if (!confirm('Remove this webpage?')) return;
   try {
     const res = await fetch(`${API}/webpages/${encodeURIComponent(url)}`, {
-      method: 'DELETE', headers: authHeaders(),
+      method: 'DELETE',
     });
-    if (res.status === 401) { logout(); return; }
     showToast('Webpage removed.', 'success');
     loadWebpages();
   } catch { showToast('Failed to remove.', 'error'); }

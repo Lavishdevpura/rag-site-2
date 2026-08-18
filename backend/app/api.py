@@ -35,7 +35,6 @@ from urllib.parse import unquote
 from bs4 import BeautifulSoup
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from auth import create_login_endpoint, require_auth, verify_access_token
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import redis_client
@@ -272,7 +271,6 @@ async def _get_job(job_id: str) -> dict | None:
 
 
 app = FastAPI(title="RAG API", docs_url="/swagger", redoc_url="/redoc")
-create_login_endpoint(app)
 
 # Forked from Layla (InsureHub-RAG) 2026-08-17: this fork has no specialist
 # bots, no human-agent handoff, and no escalation — a single RAG assistant
@@ -298,11 +296,11 @@ _NO_CACHE_HEADERS = {"Cache-Control": "no-cache"}
 
 @app.get("/")
 async def root():
-    """Serve the React chat frontend if built, otherwise redirect to /auth."""
+    """Serve the React chat frontend if built, otherwise redirect to /admin."""
     _index = os.path.join(_FRONTEND_DIST, "index.html")
     if os.path.isfile(_index):
         return FileResponse(_index, headers=_NO_CACHE_HEADERS)
-    return RedirectResponse(url="/auth", status_code=302)
+    return RedirectResponse(url="/admin", status_code=302)
 
 @app.get("/app.css")
 async def app_css():
@@ -311,10 +309,6 @@ async def app_css():
 @app.get("/app.js")
 async def app_js():
     return FileResponse(os.path.join(_FRONTEND_DIST, "app.js"), media_type="application/javascript", headers=_NO_CACHE_HEADERS)
-
-@app.get("/auth")
-async def auth_page():
-    return FileResponse(os.path.join(_FRONTEND_DIST, "auth.html"), headers=_NO_CACHE_HEADERS)
 
 @app.get("/admin")
 async def admin_page():
@@ -638,7 +632,7 @@ def _chunk_transcript(transcript_text: str, url: str, title: str = "", doc_meta:
 
 # ── Upload Video (any video URL) ───────────────────────────────────────────────────
 @app.post("/upload-video")
-async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
+async def upload_video(req: URLRequest):
     from video_store import _normalize_video_url
     url = _normalize_video_url(req.url.strip())
     multi = _get_multi_rag()
@@ -695,7 +689,7 @@ async def upload_video(req: URLRequest, _: str = Depends(require_auth)):
 
 # ── Upload Webpage (permanent) ───────────────────────────────────────────────
 @app.post("/upload-webpage")
-async def upload_webpage(req: URLRequest, _: str = Depends(require_auth)):
+async def upload_webpage(req: URLRequest):
     url = req.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL.")
@@ -825,7 +819,7 @@ async def list_videos():
 
 # ── Delete video ─────────────────────────────────────────────────────────────
 @app.delete("/videos")
-async def delete_video(url: str, _: str = Depends(require_auth)):
+async def delete_video(url: str):
     from video_store import _normalize_video_url
     import re as _re
     url = _normalize_video_url(unquote(url))
@@ -865,7 +859,7 @@ async def list_webpages():
 
 # ── Delete webpage ───────────────────────────────────────────────────────────
 @app.delete("/webpages")
-async def delete_webpage(url: str, _: str = Depends(require_auth)):
+async def delete_webpage(url: str):
     url = unquote(url)
     multi = _get_multi_rag()
     if not multi.webpage_exists(url):
@@ -927,7 +921,7 @@ async def ask_documents_only(req: AskRequest):
 
 # ── Upload (async) ────────────────────────────────────────────────────────────
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), _: str = Depends(require_auth)):
+async def upload(file: UploadFile = File(...)):
     await _prune_jobs()
     suffix = os.path.splitext(file.filename or "")[1].lower()
     supported = ALLOWED_EXTENSIONS
@@ -1372,7 +1366,7 @@ async def list_docs():
 
 
 @app.delete("/docs")
-async def clear_docs(_: str = Depends(require_auth)):
+async def clear_docs():
     await asyncio.to_thread(_get_pipeline().clear_documents)
     return {"status": "cleared"}
 
@@ -1412,7 +1406,7 @@ def _invalidate_query_cache() -> bool:
 
 
 @app.post("/admin/cache/clear", tags=["admin"])
-async def clear_kv_cache(_: str = Depends(require_auth)):
+async def clear_kv_cache():
     """Clear the KV answer cache. All future queries will regenerate fresh answers."""
     ok = await asyncio.to_thread(_invalidate_query_cache)
     if not ok:
@@ -1421,7 +1415,7 @@ async def clear_kv_cache(_: str = Depends(require_auth)):
 
 
 @app.delete("/docs/{name:path}")
-async def remove_doc(name: str, _: str = Depends(require_auth)):
+async def remove_doc(name: str):
     pipeline = _get_pipeline()
     filenames_before = set(pipeline.vector_store.list_values("filename"))
     if name not in filenames_before:
@@ -1457,8 +1451,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
 # ── REST aliases for frontend (/videos POST, /webpages POST) ─────────────────
 # Frontend uses REST-idiomatic POST /videos and POST /webpages; register the
 # same handlers under both paths without duplicating logic.
-app.add_api_route("/videos",   upload_video,   methods=["POST"], dependencies=[Depends(require_auth)])
-app.add_api_route("/webpages", upload_webpage, methods=["POST"], dependencies=[Depends(require_auth)])
+app.add_api_route("/videos",   upload_video,   methods=["POST"])
+app.add_api_route("/webpages", upload_webpage, methods=["POST"])
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

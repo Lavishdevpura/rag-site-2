@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const apiUrl = (process.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
-const panelFiles = ['auth.html', 'admin.html'];
+const panelFiles = ['admin.html'];
 
 let copied = 0;
 for (const file of panelFiles) {
@@ -20,4 +20,4 @@ for (const file of panelFiles) {
   console.log(`[copy-panels] ✓ ${file}`);
   copied++;
 }
-console.log(`[copy-panels] Done — ${copied} panels copied, API: ${apiUrl || '(none — users enter it at login)'}`);
+console.log(`[copy-panels] Done — ${copied} panels copied, API: ${apiUrl || '(none — same-origin)'}`);
