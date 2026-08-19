@@ -352,11 +352,22 @@ function renderThread() {
 // IRDAI/regulatory sources + the SBI General standard policy wordings.
 // Each of these was tested live against the real KB before being added
 // here, so update this list if the knowledge base changes significantly.
+//
+// 2026-08-19: swapped out the original 2 policy-wording questions
+// ("cancellation and refunds" / "premium payment and renewal") — both
+// asked about "the policy" generically, and this KB's PDF is a single
+// multi-section SME package wording (Fire, Machinery Breakdown, Marine,
+// Employees' Compensation, etc. all bundled together), so a vague "the
+// policy" question risks pulling boilerplate from the wrong section.
+// Replaced with one webpage question and one question scoped to a named,
+// specific section — both verified live against the real KB/source before
+// being added (gicouncil.in fetched directly and cross-checked; the
+// Section I answer matched page 12 of the PDF near-verbatim).
 const EXAMPLE_QUESTIONS = [
   'What is IRDAI?',
   'What is Bima Bharosa and how does it help policyholders?',
-  'What does the policy say about cancellation and refunds?',
-  'What does the policy say about premium payment and renewal?',
+  'What is the General Insurance Council and what does it do?',
+  'What does Section I (Standard Fire and Special Perils) cover under the SBI General Bharat Laghu Udyam Suraksha policy?',
 ];
 
 function buildEmptyState() {
