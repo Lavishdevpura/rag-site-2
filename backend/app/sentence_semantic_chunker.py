@@ -146,18 +146,57 @@ def _page_sort_key(doc: Document) -> int:
 
 def _sentences_with_pages(docs: List[Document]) -> tuple:
     """Flatten *docs* (already sorted by page, all from one source) into one
-    sentence list, remembering which page each sentence came from. Sentences
-    from consecutive pages sit next to each other in the same list, so the
-    similarity/breakpoint logic below naturally spans page breaks instead of
-    forcing a chunk boundary at every page edge — no marker-embedding trick
-    needed since we never re-merge into one blob of raw text."""
-    sentences: List[str] = []
-    pages: List[Any] = []
+    sentence list, remembering which page each sentence came from.
+
+    Splits sentences on the FULL concatenated text across all pages, not
+    per-page. A real sentence can straddle a PDF page break (its subject on
+    one page, the predicate carrying the actual defining fact on the next)
+    — calling _split_sentences() separately on each doc.page_content tears
+    that one sentence into two fragments before the chunker ever sees it as
+    a single unit, and each fragment then competes independently for a
+    chunk boundary (including Step 5a's 500-token forced split, which has
+    no way to know the two fragments were ever one sentence). Confirmed
+    live: an HDFC Ergo group-health clause — "Expenses related to the
+    treatment of a pre-existing disease (PED) and its direct complications
+    shall be excluded until the expiry of 36 months..." — split exactly at
+    its page break into "...complications" (page 58) and "shall be
+    excluded until..." (page 59) as two separate sentence units. The
+    forced-split landed on that same seam, so the retrieved "36 months"
+    chunk had lost the words identifying what the 36 months was FOR, and
+    generation grabbed an unrelated clause's "no waiting period" line
+    instead — a wrong-clause misattribution downstream of a chunk that was
+    already missing its own subject. Page numbers are tracked via a
+    word-count offset instead of per-page pre-splitting, so each sentence
+    still gets attributed to the page its first word actually appears on.
+    """
+    text_parts: List[str] = []
+    page_word_boundaries: List[tuple] = []  # (cumulative_word_count_through_this_page, page_value)
+    word_count = 0
     for doc in docs:
         page_value = doc.metadata.get("page") or doc.metadata.get("page_number") or doc.metadata.get("page_num") or 0
-        for sent in _split_sentences(doc.page_content):
-            sentences.append(sent)
-            pages.append(page_value)
+        content = doc.page_content
+        if not content:
+            continue
+        text_parts.append(content)
+        word_count += len(content.split())
+        page_word_boundaries.append((word_count, page_value))
+
+    full_text = " ".join(text_parts)
+    sentences = _split_sentences(full_text)
+    if not sentences:
+        return [], []
+
+    pages: List[Any] = []
+    word_cursor = 0
+    boundary_idx = 0
+    for sent in sentences:
+        while (
+            boundary_idx < len(page_word_boundaries) - 1
+            and word_cursor >= page_word_boundaries[boundary_idx][0]
+        ):
+            boundary_idx += 1
+        pages.append(page_word_boundaries[boundary_idx][1] if page_word_boundaries else 0)
+        word_cursor += len(sent.split())
     return sentences, pages
 
 
