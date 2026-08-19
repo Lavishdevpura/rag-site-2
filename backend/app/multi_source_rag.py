@@ -9941,9 +9941,26 @@ class MultiSourceRAG:
             # self-contained sentence). Anchored to the start of the unit
             # (after an optional short lead-in word) since a mid-sentence
             # "this"/"it" is too common to safely treat as dangling.
+            # Third pattern, confirmed live (2026-08-19): dropping "An
+            # Indian insurer can place up to ₹75 crore ... during a
+            # financial year" (a _currency_bad drop) left "Prior approval
+            # from the Authority is required for any placement exceeding
+            # this limit." — a mid-sentence noun-phrase backref ("this
+            # limit"), not the sentence-opening pronoun or the "in/under
+            # this case" shape the first two patterns already cover.
+            # Unanchored (matched anywhere in the unit, same as the "in/
+            # under this case" branch) since the model phrases this as a
+            # trailing clause ("...exceeding this limit."), not a leading
+            # one. Scoped to nouns that specifically stand in for a
+            # dropped figure/threshold — "this policy"/"this section"
+            # legitimately self-reference something other than a stripped
+            # number far more often than not, so they're deliberately left
+            # out.
             _BACKREF_RE = _re5.compile(
                 r'\b(?:in|under)\s+(?:such|this|that|these|those)\s+'
                 r'(?:case|cases|circumstance|circumstances|situation|situations)\b'
+                r'|\b(?:this|that|these|those)\s+(?:limit|limits|amount|amounts|threshold|thresholds|'
+                r'figure|figures|number|numbers|value|values|sum|cap|ceiling|rate|rates)\b'
                 r'|^(?:so|also|however|additionally|furthermore)?[,:]?\s*(?:this|that|these|those)\b'
                 r'|^(?:so|also|however|additionally|furthermore)?[,:]?\s*it\b\s+(?:is|are|was|were|refers?|applies|provided)\b',
                 _re5.IGNORECASE,

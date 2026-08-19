@@ -83,7 +83,13 @@ _POLICY_PATTERNS: dict[str, list[str]] = {
                           "third party motor", "own damage", "ncb", "no claim bonus",
                           "road accident", "traffic accident",
                           "motor fleet", "fleet insurance", "commercial vehicle insurance",
-                          "goods carrying vehicle", "indian motor tariff"],
+                          "goods carrying vehicle", "indian motor tariff",
+                          # Kept as two-word phrases, not bare "vehicle" —
+                          # see the module comment above on why bare short
+                          # words are excluded here. Added alongside the
+                          # matching classify_query_policy_type() fix
+                          # (_POLICY_TYPE_HINTS above) for the same gap.
+                          "commercial vehicle", "goods carrying"],
     "home":              ["home insurance", "property insurance", "building insurance",
                           "contents insurance", "household insurance",
                           "houseowners policy", "householders policy"],
@@ -725,12 +731,26 @@ _POLICY_TYPE_HINTS: dict[str, dict] = {
             "two-wheeler", "automobile", "collision", "fender bender",
             "motor fleet", "fleet insurance", "commercial vehicle insurance",
             "goods carrying vehicle", "indian motor tariff",
+            "commercial vehicle", "goods carrying",
         ],
         "regex": [
             r"\bcar insurance\b", r"\bmotor insurance\b", r"\bvehicle insurance\b",
             r"\bauto insurance\b", r"\bmotor vehicle\b", r"\bcomprehensive motor\b",
             r"\bmotor fleet\b", r"\bfleet insurance\b", r"\bcommercial vehicle insurance\b",
             r"\bgoods carrying vehicle\b", r"\bindian motor tariff\b",
+            # Added 2026-08-19: the exact-phrase entries above ("commercial
+            # vehicle insurance", "goods carrying vehicle") require BOTH
+            # words plus a suffix — confirmed live, "Is there a compulsory
+            # excess under the commercial vehicle goods carrying policy?"
+            # (a completely natural way to refer to the actual product,
+            # "Goods Carrying Commercial Vehicle Policy") matched neither,
+            # classified as "general", and — with ENABLE_METADATA_FILTERING
+            # on — silently excluded the correctly motor-tagged compulsory-
+            # deductible chunk that actually answers the question. Bare
+            # "commercial vehicle" / "goods carrying" cover the natural
+            # word-order variants without requiring "insurance"/"vehicle"
+            # as a fixed suffix.
+            r"\bcommercial vehicle\b", r"\bgoods carrying\b",
             # Narrowed from bare \bthird.?party\b (2026-07-16) — "third party"
             # alone is a general legal/insurance concept spanning liability,
             # professional indemnity, and general insurance principles, not
