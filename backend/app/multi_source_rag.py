@@ -5615,6 +5615,13 @@ class MultiSourceRAG:
                 page = chunk.metadata.get("page", "?")
                 label = f"Document: {src} (Page {page})"
                 sources.append(f"{src} (page {page})")
+            # Surface the chunk's own section heading (when the chunker
+            # detected one) so the model sees which numbered clause/section
+            # this text belongs to — same fix as Layla's, see
+            # sentence_semantic_chunker.py's module docstring for why.
+            _section_heading = chunk.metadata.get("section_heading", "")
+            if _section_heading:
+                label = f"{label} — Section: {_section_heading}"
             context_parts.append(f"[{label}]\n{chunk.page_content}")
         full_context = "\n\n".join(context_parts)
         if len(full_context) > self.max_context_chars:
@@ -7543,7 +7550,10 @@ class MultiSourceRAG:
         # same chunk and got dropped). Grounding checks should ask "is this
         # actually in what we retrieved," not "does it survive a budget
         # cut made for an unrelated reason."
-        _full_context_uncompressed = "\n\n".join(c.page_content for c in all_chunks)
+        _full_context_uncompressed = "\n\n".join(
+            (f"[{h}]\n{c.page_content}" if (h := c.metadata.get("section_heading", "")) else c.page_content)
+            for c in all_chunks
+        )
 
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > _context_budget:
@@ -7575,6 +7585,9 @@ class MultiSourceRAG:
                 page = chunk.metadata.get("page", "?")
                 label = f"Document: {src} (Page {page})"
                 sources.append(f"{src} (page {page})")
+            _section_heading = chunk.metadata.get("section_heading", "")
+            if _section_heading:
+                label = f"{label} — Section: {_section_heading}"
             # Phase 1 (contamination plan): generation used to see the
             # chunk's ENTIRE page_content, so a mixed "general"-tagged
             # chunk's off-topic sentence (e.g. a marine example embedded in
