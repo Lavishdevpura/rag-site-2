@@ -10358,6 +10358,7 @@ class MultiSourceRAG:
         # Set unconditionally for the same reason as _dropped_num /
         # _refund_units_dropped above.
         _denial_units_dropped = False
+        _coverage_claim_units_dropped = False
 
         # ── Drop coverage-denial claims not actually named in the source ──────
         # Confirmed live: "if I intentionally damage my car under motor
@@ -10554,6 +10555,110 @@ class MultiSourceRAG:
         except Exception as _denial_exc:
             logger.debug("[ask_stream] unsupported-denial-claim filter skipped: %s", _denial_exc)
 
+        # ── Drop coverage claims contradicted by a sibling exclusion heading ──
+        # Mirror of the denial-claim-mismatch filter above, for the opposite
+        # failure direction. Confirmed live: a "17.24 Tobacco" clause never
+        # repeats the word "excluded" in its own text, but sits directly
+        # next to "17.25 Additional Exclusions" — a numbered sibling entry
+        # whose own heading names it an exclusions list. The model reads
+        # "tobacco" and states it's covered, missing the structural cue
+        # since nothing in that item's own sentence says so. Two separate
+        # prompt-rule phrasings (told the model to infer this) both failed
+        # to reliably prevent it on retest — a 2-hop inference a small model
+        # doesn't reliably make under instruction alone — so this is the
+        # deterministic backstop, not scoped to tobacco/17.24/17.25
+        # specifically: it fires on any named item whose only source
+        # mention sits near a numbered "N.N ... Exclusion(s)" heading.
+        try:
+            import re as _re8
+            _NUMBERED_EXCLUSION_HEADING_RE = _re8.compile(
+                r"\b\d{1,3}\.\d{1,3}\s+(?:[A-Za-z]+\s+){0,3}Exclu\w*",
+                _re8.IGNORECASE,
+            )
+            _COVERAGE_AFFIRM_RE = _re8.compile(
+                r"\bcovers?\b|\bis\s+covered\b|\bare\s+covered\b|\bcovered\s+under\b|"
+                r"\bincludes?\s+coverage\b",
+                _re8.IGNORECASE,
+            )
+            # Deliberately self-contained (own stopword set, doesn't reuse
+            # _DENIAL_STOPWORDS/_denial_scenario_words from the block above)
+            # so this filter still runs correctly even if that block's own
+            # try raised before defining them.
+            _CA_STOPWORDS = frozenset({
+                'the', 'a', 'an', 'and', 'or', 'but', 'if', 'will', 'would',
+                'can', 'could', 'should', 'is', 'are', 'was', 'were', 'be',
+                'been', 'being', 'do', 'does', 'did', 'my', 'your', 'i',
+                'you', 'it', 'me', 'to', 'of', 'in', 'on', 'for', 'under',
+                'with', 'get', 'any', 'that', 'this', 'also', 'well',
+                'policy', 'policies', 'covers', 'cover', 'covered',
+                'covering', 'coverage', 'includes', 'include', 'including',
+                'insured', 'insurer', 'claim', 'claims', 'related', 'same',
+            }) | frozenset(w.lower() for term in _INSURANCE_VOCAB for w in term.split())
+
+            def _ca_item_words(text: str) -> set:
+                words = _re8.findall(r"\b[a-zA-Z]{3,}\b", (text or ''))
+                return {w.lower() for w in words if w.lower() not in _CA_STOPWORDS}
+
+            _ca_reply_src = (_corrected_text or _reply_stripped)
+            _reply_has_coverage_claim = bool(_COVERAGE_AFFIRM_RE.search(_ca_reply_src))
+
+            if _reply_has_coverage_claim and _full_context_uncompressed:
+                _ca_has_points = bool(_re8.search(r'(?:^|\n)\s*\d+\.\s', _ca_reply_src))
+                _ca_units = (
+                    _re8.split(r'\n(?=\s*\d+\.\s)', _ca_reply_src)
+                    if _ca_has_points
+                    else _re8.split(r'(?<=[.!?])(?<!\d\.)\s+', _ca_reply_src)
+                )
+
+                _ca_kept = []
+                for _unit in _ca_units:
+                    _contradicted = False
+                    if _COVERAGE_AFFIRM_RE.search(_unit):
+                        for _w in _ca_item_words(_unit):
+                            for _m in _re8.finditer(r'\b' + _re8.escape(_w) + r'\b', _full_context_uncompressed, _re8.IGNORECASE):
+                                _window = _full_context_uncompressed[max(0, _m.start() - 300):_m.end() + 300]
+                                if _NUMBERED_EXCLUSION_HEADING_RE.search(_window):
+                                    _contradicted = True
+                                    break
+                            if _contradicted:
+                                break
+                    if _contradicted:
+                        _coverage_claim_units_dropped = True
+                    else:
+                        _ca_kept.append(_unit)
+
+                if _coverage_claim_units_dropped and _ca_kept:
+                    if _ca_has_points:
+                        _ca_point_re = _re8.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', _re8.DOTALL)
+                        _ca_renumbered, _ca_next_n = [], 1
+                        for _u in _ca_kept:
+                            _m = _ca_point_re.match(_u)
+                            if _m:
+                                _ca_renumbered.append(f"{_m.group(1)}{_ca_next_n}{_m.group(3)}{_m.group(4)}")
+                                _ca_next_n += 1
+                            else:
+                                _ca_renumbered.append(_u)
+                        _ca_rebuilt = "\n".join(_ca_renumbered).strip()
+                    else:
+                        _ca_rebuilt = " ".join(_ca_kept).strip()
+                        if _ca_rebuilt and _ca_rebuilt[-1] not in ".!?":
+                            _ca_rebuilt += "."
+                    _corrected_text = _ca_rebuilt
+                    _kv_reply = _ca_rebuilt
+                    logger.info(
+                        "[ask_stream] dropped coverage claim contradicted by a "
+                        "sibling numbered exclusion heading in the retrieved source"
+                    )
+                elif _coverage_claim_units_dropped and not _ca_kept:
+                    # Whole reply was a now-contradicted coverage claim —
+                    # same "don't empty the reply" convention as the
+                    # denial-claim-mismatch block above: leave it alone here,
+                    # the hollow-answer check below will redirect it to a
+                    # refusal once it sees _coverage_claim_units_dropped.
+                    pass
+        except Exception as _ca_exc:
+            logger.debug("[ask_stream] coverage-claim-mismatch filter skipped: %s", _ca_exc)
+
         # ── Third-party-victim contamination in first-party examples (brief) ──
         # Confirmed live: "personal accident insurance" — a first-party-only
         # type where the INSURED is always the one who suffers the loss,
@@ -10700,7 +10805,7 @@ class MultiSourceRAG:
                 # a unit, don't require the domain-word absence too — a
                 # topic-naming stub with nothing else left is exactly the
                 # hollow shape those filters are known to produce.
-                _prior_unit_dropped = bool(_dropped_num) or _refund_units_dropped or _denial_units_dropped
+                _prior_unit_dropped = bool(_dropped_num) or _refund_units_dropped or _denial_units_dropped or _coverage_claim_units_dropped
                 if _hollow_src and _word_count < 12 and (not _has_domain_word or _prior_unit_dropped):
                     _refusal_text = (
                         "Hmm, I don't have that specific information in my knowledge base right now. "
