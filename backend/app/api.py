@@ -449,6 +449,95 @@ def _describe_llm_failure(exc: Exception) -> tuple[int, str]:
     return 500, "The backend could not generate an answer due to an unexpected internal error."
 
 
+def _discover_candidate_types_for_general_sections(chunks, chunk_ids, filename: str) -> None:
+    """
+    Document-side open-vocabulary candidate-type discovery, background
+    thread. Different shape from Layla's own version deliberately, not
+    a copy of it — the two forks' ingestion pipelines aren't the same
+    shape, so wiring this in has to follow rag_site_2's own structure:
+
+    Layla's SectionChunker does its per-section policy_type classification
+    as a SEPARATE step api.py orchestrates (regex first-pass, then a
+    synchronous LLM verify/enrich pass), and its own background thread
+    (_reclassify_chunks_with_llm) re-runs that full verify/enrich again
+    with a real LLM, with candidate-type discovery folded in as one part
+    of a larger 2-pass verify-and-anchor-correct system.
+
+    This fork's chunker (sentence_semantic_chunker.py) already decides
+    section_id/section_heading/policy_type ENTIRELY INSIDE split_documents()
+    itself, synchronously, regex-only, before _ingest_file ever sees the
+    chunks (see that module's own docstring, Step 6) — there is no
+    separate verify/enrich step here to re-run, and deliberately no LLM
+    call anywhere in the synchronous path (this fork's ingestion is
+    designed to never block on one, same reasoning as tag_document's own
+    llm=None above). So this function does ONE narrower thing, matching
+    what's actually missing here: for every section the synchronous pass
+    left with no confident policy_type (implicitly "general"), ask an LLM
+    for an open-ended candidate label via classify_candidate_type() —
+    which already handles the cheap-match/promotion-threshold/write-back
+    bookkeeping entirely on its own (see candidate_vocab.upsert_candidate,
+    which calls maybe_promote() itself) — and tag the section's own chunks
+    with the result for retrieval's candidate-match bypass to use. No
+    verify/enrich re-check of the already-decided policy_type, and no
+    in-document anchor-correction pass — that machinery is what actually
+    produced the generic-word-regex bug fixed in candidate_vocab.py
+    (project note: promote_to_active_vocab's old unfiltered fallback), and
+    this fork doesn't need the complexity that pass exists for (Layla's
+    own per-section verify/enrich has its own accuracy concerns to correct
+    against; this fork's regex-only first pass has no equivalent second
+    opinion, so there's nothing here for an anchor-correction pass to
+    correct against in the first place).
+
+    Gated on ENABLE_METADATA_FILTERING — candidate types only ever feed
+    the policy_type-based retrieval filter and the candidate-match
+    reranking bypass, both already no-ops when that flag is off, so
+    discovering them would just be a wasted background LLM call.
+    """
+    try:
+        from metadata_tagger import classify_candidate_type, ENABLE_METADATA_FILTERING
+        if not ENABLE_METADATA_FILTERING:
+            return
+        from router import get_classification_llm
+        candidate_llm = get_classification_llm(temperature=0)
+        pipeline = _get_pipeline()
+        tvec = pipeline.vector_store._store
+
+        sections: dict = {}
+        for cid, chunk in zip(chunk_ids, chunks):
+            sid = chunk.metadata.get("section_id") or cid
+            sections.setdefault(sid, []).append((cid, chunk))
+
+        updated = 0
+        for section_items in sections.values():
+            # Already confidently classified by the synchronous regex vote
+            # (sentence_semantic_chunker.py's own Step 6b) — the closed
+            # vocabulary already has an answer for this section, nothing
+            # to discover.
+            if any(c.metadata.get("policy_type") for _, c in section_items):
+                continue
+            heading = section_items[0][1].metadata.get("section_heading", "")
+            section_text = "\n\n".join(c.page_content for _, c in section_items)
+            label = classify_candidate_type(
+                f"{heading}\n\n{section_text}" if heading else section_text,
+                llm=candidate_llm, source=filename, source_type="chunk",
+            )
+            if not label:
+                continue
+            for cid, _ in section_items:
+                meta = tvec._metadatas.get(cid)
+                if meta is not None and meta.get("candidate_policy_type") != label:
+                    meta["candidate_policy_type"] = label
+                    updated += 1
+        if updated:
+            tvec._save_state()
+        logger.info(
+            "[candidate discovery] '%s': tagged %d chunk(s) with a candidate_policy_type across %d section(s)",
+            filename, updated, len(sections),
+        )
+    except Exception:
+        logger.exception("[candidate discovery] failed for '%s'", filename)
+
+
 def _ingest_file(tmp_path: str, filename: str) -> int:
     from document_loader import load_document
     from metadata_tagger import tag_document, classify_document_type
@@ -486,12 +575,11 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     for chunk in chunks:
         chunk.metadata["source"] = unique_source
         chunk.metadata["filename"] = filename
-        # SentenceSemanticChunker doesn't set policy_type per-chunk (no
-        # per-section classification, metadata filtering is off for this
-        # fork) — this always falls through to the doc-level tag below.
-        # Kept as a chunk-wins/doc-level-fallback guard anyway, matching the
-        # same order used by the webpage and video ingestion paths, in case
-        # a future chunker starts setting it again.
+        # SentenceSemanticChunker sets policy_type per-chunk when its own
+        # section-level regex vote is confident (see its module docstring's
+        # Step 6) — this chunk-wins/doc-level-fallback guard lets that take
+        # priority over the coarser document-level tag below, matching the
+        # same order used by the webpage and video ingestion paths.
         _chunk_policy_type = chunk.metadata.get("policy_type")
         chunk.metadata.update(doc_tags)
         # Guarantee doc_type is not overwritten by doc_tags (it is set there
@@ -511,6 +599,16 @@ def _ingest_file(tmp_path: str, filename: str) -> int:
     _threading.Thread(
         target=pipeline._upsert_summary,
         args=(chunks, unique_source, doc_meta, llm),
+        daemon=True,
+    ).start()
+
+    # Same non-blocking reasoning as the summary thread above — see
+    # _discover_candidate_types_for_general_sections's own docstring for
+    # why this fork needs a narrower version of Layla's background
+    # reclassify step rather than a copy of it.
+    _threading.Thread(
+        target=_discover_candidate_types_for_general_sections,
+        args=(chunks, chunk_ids, filename),
         daemon=True,
     ).start()
     return len(chunks)
