@@ -547,6 +547,16 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
     Load a PDF with per-page Documents.
 
     Strategy:
+      0. pymupdf4llm markdown conversion is tried FIRST (ported from
+         rag_site_1 2026-09-08, see pdf_to_markdown.load_pdf_pages_as_
+         markdown) — it derives heading structure from the PDF's own
+         font-size/bold metadata rather than guessing from plain text,
+         which the chunker downstream uses to detect real section AND
+         sub-heading boundaries (see sentence_semantic_chunker.py). Falls
+         through to the plain-text path below automatically on ANY
+         failure (missing dependency, corrupt/unreadable file, or any
+         other pymupdf4llm error) — this is strictly additive, never a
+         hard requirement for a PDF to load.
       1. pypdf extracts all pages it can
       2. For pages pypdf returned empty text, pdfplumber is tried as a per-page fallback
          (handles complex layouts, tables, and PDFs with non-standard encoding)
@@ -555,6 +565,37 @@ def _load_pdf(file_path: str, filename: str = "") -> list[Document]:
     """
     _src  = filename or file_path
     _base = filename or os.path.basename(file_path)
+
+    # ── pymupdf4llm markdown conversion (preferred — real PDF structure) ──────
+    try:
+        from pdf_to_markdown import load_pdf_pages_as_markdown
+
+        md_pages = load_pdf_pages_as_markdown(file_path)
+        if md_pages:
+            md_pages = _strip_repeating_page_furniture(md_pages)
+            docs = [
+                Document(
+                    page_content=md_pages[page_num],
+                    metadata={
+                        "source":      _src,
+                        "filename":    _base,
+                        "page":        page_num + 1,
+                        "total_pages": max(md_pages) + 1,
+                    },
+                )
+                for page_num in sorted(md_pages)
+            ]
+            logger.info(
+                "[PDF/markdown] Loaded %d page(s) from '%s' via pymupdf4llm",
+                len(docs), _base,
+            )
+            return docs
+    except Exception as exc:
+        logger.info(
+            "[PDF/markdown] pymupdf4llm conversion unavailable or failed for '%s' "
+            "(%s) — falling back to plain-text extraction",
+            _base, exc,
+        )
 
     # ── pypdf (preferred — fast pure-Python reader) ───────────────────────────
     try:
