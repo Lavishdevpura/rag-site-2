@@ -3060,13 +3060,19 @@ async def _classify_query_candidate_type_llm(query: str) -> Optional[str]:
     candidate_policy_type set — the common case has nothing to compare
     against, so this call would otherwise be pure wasted latency on every
     single query.
-    """
-    from candidate_vocab import match_candidate_vocab, normalize_candidate_label, upsert_candidate
 
-    hit = match_candidate_vocab(query)
-    if hit:
-        upsert_candidate(hit, [], query, "query")
-        return hit
+    LLM-only now (2026-09-10, ported from Layla) — no longer starts with
+    a cheap keyword-overlap check against the existing candidate
+    vocabulary. Same fix, same reasoning, as metadata_tagger.classify_
+    candidate_type()'s own removal: a keyword match here can just as
+    easily latch onto an existing, unrelated candidate whose stored
+    keywords happen to overlap, and this function's own name already
+    promises "_llm" — a query is short enough that the real LLM call
+    costs little, and this only ever runs when there's already a
+    candidate-tagged chunk in the pool to compare against, not on every
+    query.
+    """
+    from candidate_vocab import normalize_candidate_label, upsert_candidate
 
     # Backend failure (timeout, connection error, empty completion) is
     # deliberately allowed to propagate here rather than being swallowed
@@ -5638,6 +5644,13 @@ _ENTAILMENT_FIXED_PROMPT_TOKENS_EST = _measure_prompt_tokens(
     "evidence's own — that alone is not a reason to say no; judge "
     "whether the evidence supports its MEANING, not whether it repeats "
     "the evidence's exact words.\n"
+    "A hypothesis that is broader or less detailed than the evidence — "
+    "one that summarizes rather than listing every specific the "
+    "evidence contains — still counts as entailed, as long as what it "
+    "states is actually supported. Only answer no when the hypothesis "
+    "asserts something the evidence does not support or contradicts, "
+    "never merely because it omits detail the evidence could have "
+    "included.\n"
     "A hypothesis stating that two named things are SEPARATE, not "
     "combined, or not covered by the same product also counts as "
     "entailed when the evidence discusses one of them without ever "
@@ -5680,6 +5693,13 @@ async def _verify_point_faithfulness(point: str, context: str) -> bool:
         "evidence's own — that alone is not a reason to say no; judge "
         "whether the evidence supports its MEANING, not whether it repeats "
         "the evidence's exact words.\n"
+        "A hypothesis that is broader or less detailed than the evidence — "
+        "one that summarizes rather than listing every specific the "
+        "evidence contains — still counts as entailed, as long as what it "
+        "states is actually supported. Only answer no when the hypothesis "
+        "asserts something the evidence does not support or contradicts, "
+        "never merely because it omits detail the evidence could have "
+        "included.\n"
         "A hypothesis stating that two named things are SEPARATE, not "
         "combined, or not covered by the same product also counts as "
         "entailed when the evidence discusses one of them without ever "
@@ -5979,7 +5999,21 @@ async def _pgf_extract_claims(text: str) -> list:
         return []
 
 
-async def _reformulate_scenario_query_for_retrieval(query: str) -> Optional[str]:
+def _split_off_signoff(text: str) -> "tuple[str, str]":
+    """Splits off the trailing sign-off pleasantry so it doesn't get fed
+    through PGF's per-point entailment check as if it were a factual
+    claim — a pleasantry has no evidence to entail it.
+    """
+    _m = _SIGNOFF_START_RE.search(text)
+    if not _m:
+        return text, ""
+    _cut = _m.start(1)
+    return text[:_cut].rstrip(), text[_cut:].strip()
+
+
+async def _reformulate_scenario_query_for_retrieval(
+    query: str, context_snippet: str = "",
+) -> Optional[str]:
     """Rewrites a colloquial, scenario-phrased question into one using the
     source material's own proper/formal terminology, for RETRIEVAL/
     RERANKING purposes only — never for the answer shown to the user,
@@ -5996,10 +6030,41 @@ async def _reformulate_scenario_query_for_retrieval(query: str) -> Optional[str]
     exact correct chunk while a jargon-phrased version of the identical
     question scores far higher — the gap is the phrasing, not relevance.
 
-    Returns None (never the original query) on any failure or a clearly-
-    unusable reply — the caller falls back to the original query text.
+    context_snippet (2026-09-10, user's explicit direction): this fork's
+    whole corpus is a single narrow domain (unlike Layla, which spans many
+    different policy types and can't assume one document is "the" answer)
+    — its own top cosine-ranked candidate is a strong signal for what
+    vocabulary the rewrite should reach for, so the caller passes the
+    actual text of that top candidate here instead of leaving the model to
+    guess blind. Confirmed live this gap was real, not theoretical: for
+    "if hackers threaten to leak our data unless we pay them, is there a
+    cap on what the policy will pay towards that?" the blind version
+    guessed "ransomware attack policy" / "data breach threat" — plausible-
+    sounding, but not this document's own term — and the reranker scored
+    that rewrite at 0.072 against the actual chunk, barely above the
+    original phrasing's 0.021. The chunk's own real term, "Cyber
+    Extortion," scored 0.415 on the identical chunk — a ~6x gap from
+    guessing wrong instead of reading the document. Grounding the rewrite
+    in real retrieved text (already fetched for the cosine pass, no extra
+    retrieval cost) lets the model copy the actual term instead of
+    inventing a plausible synonym.
     """
     try:
+        _context_block = ""
+        if context_snippet:
+            _context_block = f"""
+
+A possibly-relevant excerpt from the actual source document (it may or may not
+cover the same situation as the question below — judge that yourself):
+---
+{context_snippet[:600]}
+---
+If this excerpt covers the SAME situation as the question, reuse its own exact
+terms and phrasing in your rewrite rather than a synonym or a plausible-
+sounding guess — even if your own guess would also be technically correct,
+the document's own wording is what actually needs to match. If the excerpt is
+about something else entirely, ignore it and rewrite using your own judgment
+as usual."""
         prompt = f"""The question below describes a real-world situation in plain, everyday
 language. Rewrite it as a single direct question using the proper technical/formal
 terminology this kind of document would use, naming the SPECIFIC thing, activity, or
@@ -6016,7 +6081,7 @@ Rewrite: What does marine cargo insurance cover for goods damaged in transit?
 
 The two examples above are ONLY illustrations of the rewrite PATTERN — never reuse
 their wording, their scenario, or any fact from them. Rewrite ONLY the real Question
-below, about its own actual situation, whatever that situation is.
+below, about its own actual situation, whatever that situation is.{_context_block}
 
 Question: {query!r}
 Rewrite:"""
@@ -6091,6 +6156,7 @@ class MultiSourceRAG:
         summary_top_k: int,
         media_top_k: int,
         chunk_limit: int,
+        original_question: str = "",
     ) -> List[Document]:
         """
         Fetch raw (unreranked) candidates from doc, video, and webpage
@@ -6213,7 +6279,41 @@ class MultiSourceRAG:
         # in retrieval-friendly terms just keeps its own first-pass result.
         if ranked:
             try:
-                reformulated = await _reformulate_scenario_query_for_retrieval(retrieval_query)
+                # Ground the rewrite in this document's own real text
+                # (2026-09-10) — reuses ranked (already computed just above,
+                # no extra cost) rather than combined. Confirmed live this
+                # distinction is real, not cosmetic: combined is the RAW,
+                # unranked bi-encoder/hybrid pool — for "if hackers threaten
+                # to leak our data unless we pay them", combined[0] came back
+                # as a commercial-vehicle "Break-In Protection" clause (car
+                # locks/keys), not anything about cyber — "break in"/"pay"
+                # apparently matched well enough on hybrid keyword scoring
+                # alone to win an UNRANKED list in a multi-product corpus.
+                # ranked[0] is the cross-encoder's own top pick from that
+                # same pool — even when its score is too low to pass the
+                # gate for the ORIGINAL phrasing, its ranking is still a far
+                # more reliable relevance signal than an arbitrary raw-pool
+                # first element, since it's the one signal in this whole
+                # function that actually reads query and passage together.
+                _context_snippet = ranked[0].page_content if ranked else ""
+                # Reformulate from the TRUE original question, not
+                # retrieval_query (2026-09-10, found via live testing) —
+                # by this point retrieval_query is already the FIRST
+                # reformulation pass's own output (e.g. "...ransomware
+                # demands for data protection?"), and asking the model to
+                # reformulate an already-reformulated-but-wrong phrasing a
+                # second time just gets the same wrong phrasing back, even
+                # WITH the real document context attached — confirmed live,
+                # byte-identical output both times. Handing it the actual
+                # original wording instead gives it a fresh, unguided shot
+                # at the document context: same context, same model, same
+                # prompt, but starting from "hackers threaten to leak our
+                # data" instead of "ransomware demands" correctly produced
+                # "Cyber Extortion" (the document's own term) on both
+                # backends tested.
+                reformulated = await _reformulate_scenario_query_for_retrieval(
+                    original_question or retrieval_query, context_snippet=_context_snippet,
+                )
                 if reformulated:
                     ranked_v2 = await asyncio.to_thread(
                         self.doc_pipeline._vector_store.rerank_documents,
@@ -7378,6 +7478,48 @@ class MultiSourceRAG:
             logger.info("[ask_stream] bypassing cache hit for clarify-chip click: %r", retrieval_query[:80])
             _kv_hit = None
 
+        # ── Cache-stampede protection (2026-09-09, ported from Layla/
+        # InsureHub-RAG-main) ──────────────────────────────────────────────
+        # Every request that reaches here with _kv_hit still None is about to
+        # pay for a full retrieval+generation pass. Several concurrent
+        # requests for the exact same not-yet-cached query would otherwise
+        # each pay that cost independently; single-flight makes only the
+        # first one (the "leader") actually generate, while concurrent
+        # duplicates ("followers") wait briefly for the leader's own cache
+        # write instead. Skipped for a chip-click bypass — that path exists
+        # specifically to FORCE fresh generation even when a cache entry
+        # already exists (see the block just above), so it must never wait
+        # for or adopt anyone else's cached answer. See QueryKVCache.
+        # try_acquire_generation_lock / wait_for_generation for the fail-open
+        # and self-healing behavior.
+        # NOTE (2026-09-10): Layla and rag_site_1 also guard this on
+        # `not _is_retry`, to protect against a recursive post-hallucination
+        # retry deadlocking against its own outer call's lock — see their
+        # own comments here for the full story. This fork has no such
+        # retry mechanism (no _retry_after_full_hallucination, no _is_retry
+        # parameter on ask_stream at all — confirmed, ask_stream never
+        # calls itself recursively here), so that specific collision can't
+        # happen and the guard doesn't apply. An earlier version of this
+        # comment/guard referenced `_is_retry` anyway, copied verbatim from
+        # site_1 without checking it actually existed in this file — a
+        # real bug (NameError on every cache-miss request) caught before
+        # ever reaching a live user.
+        if _kv_hit is None and not _disable_query_cache and not _bypass_cache_for_chip_click:
+            if await asyncio.to_thread(_kv.try_acquire_generation_lock, _kv_key):
+                logger.info("[ask_stream] cache-lock acquired, generating: %r", retrieval_query[:80])
+            else:
+                logger.info("[ask_stream] cache-lock held by another request, waiting: %r", retrieval_query[:80])
+                _kv_hit = await asyncio.to_thread(_kv.wait_for_generation, _kv_key)
+                if _kv_hit is not None:
+                    logger.info(
+                        "[ask_stream] served from concurrent request's cache write: %r", retrieval_query[:80],
+                    )
+                else:
+                    logger.info(
+                        "[ask_stream] wait for concurrent request timed out, generating independently: %r",
+                        retrieval_query[:80],
+                    )
+
         if _kv_hit is not None:
             import json as _json_s
             logger.info("[ask_stream] KV cache hit  query=%r detailed=%s", retrieval_query[:80], _keyword_detailed)
@@ -7538,6 +7680,7 @@ class MultiSourceRAG:
                 all_chunks = await self._retrieve_all_sources_combined(
                     _search_query, filter_meta, doc_top_k=_doc_top_k, summary_top_k=3,
                     media_top_k=_media_top_k, chunk_limit=_chunk_limit,
+                    original_question=question,
                 )
             llm_topics = await _topics_task
         else:
@@ -8414,6 +8557,16 @@ class MultiSourceRAG:
             (f"[{h}]\n{c.page_content}" if (h := c.metadata.get("section_heading", "")) else c.page_content)
             for c in all_chunks
         )
+        # Per-chunk list captured HERE, before the compression reassignment
+        # below — PGF (post-generation faithfulness) needs to rank/cite
+        # individual chunks against the UNCOMPRESSED text (see the comment
+        # above: checking a claim against a compressed sliver produces
+        # false rejections), and `all_chunks` itself gets reassigned to the
+        # compressed version a few lines down.
+        _full_context_uncompressed_chunks = [
+            (c.page_content, c.metadata.get("section_heading", ""), c.metadata.get("policy_type", ""))
+            for c in all_chunks
+        ]
 
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
         if total_retrieved_chars > _context_budget:
@@ -12105,6 +12258,442 @@ class MultiSourceRAG:
                     )
         except Exception as _tpb_exc:
             logger.debug("[ask_stream] third-party brand strip skipped: %s", _tpb_exc)
+
+        # ── Post-generation faithfulness check (PGF, ported from Layla via ────
+        # rag_site_1, 2026-09-10) — per-point/per-sentence entailment check
+        # using _verify_point_faithfulness/_pgf_extract_claims (both already
+        # present in this file, previously unused — no orchestration ever
+        # called them here). Runs BEFORE SRG below, since SRG's own
+        # additions never need re-verification. Same simplified shape as
+        # rag_site_1's port: no _query_policy_type chunk pre-filter (this
+        # fork runs with metadata filtering off, so every chunk in
+        # _full_context_uncompressed_chunks is eligible evidence for every
+        # unit) and no decision-query "survivor names the policy type"
+        # hollow-check (insurance-keyword-coupled, doesn't apply here).
+        #
+        # Unlike Layla/rag_site_1, this fork has NO post-hallucination
+        # retry mechanism (ask_stream has no _is_retry/_widen_retrieval
+        # parameter) — when every point/sentence fails, this goes straight
+        # to refusal rather than attempting a recursive retry, matching
+        # this file's own established absence of that mechanism elsewhere.
+        #
+        # Evidence selection uses a cross-encoder + relevance floor from
+        # the start (not the earlier bi-encoder-cosine version Layla/site_1
+        # briefly had) — see that fix's own history for why: bi-encoder
+        # cosine similarity couldn't reliably separate a genuine source
+        # match from a coincidentally-similar wrong one (measured gap as
+        # thin as 0.75 vs 0.78), which let a real hallucination survive by
+        # getting matched to the closest AVAILABLE-but-wrong chunk. The
+        # cross-encoder, scored as (unit text, chunk) pairs the same way
+        # retrieval reranking already scores (query, chunk) pairs, gives a
+        # 10x+ gap instead (0.03-0.07 for an unsupported claim vs.
+        # 0.96-0.98 for a genuinely grounded one) — wide enough margin for
+        # a 0.5 floor to safely gate on. A bi-encoder pre-filter narrows
+        # each unit to its top 5 candidates before the (much more
+        # expensive, ~0.22s/pair) cross-encoder scores them, bounding cost
+        # by unit count rather than pool size.
+        _pgf_all_points_hallucinated = False
+        try:
+            _pgf_enabled = os.getenv("ENABLE_POSTGEN_FAITHFULNESS_CHECK", "false").strip().lower() in ("1", "true", "yes")
+            _pgf_src = (_corrected_text or _reply_stripped).strip()
+            _pgf_is_refusal = _pgf_src.lower().startswith("hmm, i don't have")
+            if (
+                _pgf_enabled
+                and _pgf_src
+                and not _pgf_is_refusal
+                and not _comparison_table
+                and _full_context_uncompressed
+            ):
+                _pgf_scoped_context = _full_context_uncompressed
+                _pgf_matching_chunks = [_ct for _ct, _cs, _cpt in _full_context_uncompressed_chunks]
+
+                # Keeping only the top _PGF_TOP_K_CHUNKS trusts the ranking
+                # instead of showing a small model a much larger mixed-
+                # relevance pile it's more likely to misjudge (a narrow
+                # yes/no entailment check is far more reliable against a
+                # few top candidates than against everything at once).
+                _PGF_TOP_K_CHUNKS = 2
+
+                # Minimum cross-encoder relevance score a chunk must clear
+                # to count as real evidence for a given unit. Calibrated
+                # empirically on Layla's real content: a fabricated claim
+                # scored 0.033-0.072 against every chunk in its real
+                # candidate pool, while five genuinely-grounded claims from
+                # the same real answer scored 0.963-0.984 against their own
+                # true source chunks. 0.5 sits in the middle of that gap
+                # with margin either way.
+                _PGF_RERANK_FLOOR = 0.5
+
+                # Cross-encoder pairs cost ~0.22s each regardless of split
+                # — measured on Layla: 5 units x 8 chunks (48 pairs) took
+                # ~11s, 10 units x 15 chunks (150 pairs) took 33.6s.
+                # Unaffordable unfiltered. Narrows each unit's candidates
+                # to its top _PGF_PREFILTER_K by a cheap bi-encoder pass
+                # first — same two-stage recall-then-precision shape this
+                # file's own top-level retrieval already uses — before the
+                # cross-encoder scores only that shortlist. Only engages
+                # when the pool is actually bigger than the shortlist
+                # width.
+                _PGF_PREFILTER_K = 5
+
+                def _pgf_word_overlap_order(_unit_text: str) -> tuple:
+                    _unit_words = set(re.findall(r"[a-z]{4,}", _unit_text.lower()))
+                    if not _unit_words:
+                        return (_pgf_scoped_context, [])
+                    def _overlap(_chunk_text: str) -> int:
+                        return len(_unit_words & set(re.findall(r"[a-z]{4,}", _chunk_text.lower())))
+                    _order = sorted(range(len(_pgf_matching_chunks)), key=lambda i: _overlap(_pgf_matching_chunks[i]), reverse=True)
+                    _top = _order[:_PGF_TOP_K_CHUNKS]
+                    return ("\n\n".join(_pgf_matching_chunks[i] for i in _top), _top)
+
+                _pgf_reranker = None
+                if _pgf_matching_chunks:
+                    try:
+                        _pgf_reranker = _get_shared_reranker()
+                    except Exception as _pgf_reranker_exc:
+                        logger.debug(
+                            "[ask_stream] PGF reranker unavailable, falling back to word "
+                            "overlap for evidence ordering: %s", _pgf_reranker_exc,
+                        )
+                        _pgf_reranker = None
+
+                # Retrieval's own _rerank_windows (turbovec_store.py) caps
+                # windows at 700 chars purely for SPEED and picks only 2
+                # windows heuristically (the opening slice + one keyword-
+                # weighted guess) — confirmed live this can genuinely MISS
+                # real content, not just truncate it: a real "a. Claim bill
+                # in duplicate" list item sat inside the one window the
+                # heuristic picked, but buried behind enough preceding
+                # boilerplate (an unrelated CLAIMS PROCEDURE section ahead
+                # of it in the same chunk) to dilute its cross-encoder
+                # score to 0.33 — below _PGF_RERANK_FLOOR — even though the
+                # fact was genuinely present and correctly retrieved (it
+                # was even the cited evidence for the NEIGHBORING claim in
+                # the same answer).
+                #
+                # First fix attempt used BIGGER windows (2000 chars, close
+                # to the reranker's real ~512-token capacity) on the theory
+                # that more context would help — measured live, it only
+                # improved the same case to 0.44, still under the floor:
+                # a bigger window still buries the one-line list item under
+                # a full paragraph of unrelated procedural text ahead of
+                # it, and a cross-encoder scores the WHOLE pair jointly, so
+                # more surrounding noise still dilutes the match. Swept
+                # window sizes empirically instead of guessing again:
+                # 1000/600/400/300 chars scored 0.59/0.85/0.98/0.65 on the
+                # same real case — 400 chars (not bigger, SMALLER) is what
+                # actually isolates a single list item from its
+                # surrounding boilerplate; going smaller still (300) starts
+                # cutting the target phrase itself across a window
+                # boundary and the score drops again. Re-verified 400/200
+                # against every previously-established pass/fail case
+                # (paraphrase, partial-claim, vague-summary, the original
+                # hallucination) — all held correctly.
+                #
+                # PGF's own candidate count is already bounded by
+                # _PGF_PREFILTER_K (5 chunks/unit, never the whole pool),
+                # so unlike retrieval it can afford FULL coverage at this
+                # smaller size — every character of a candidate chunk gets
+                # seen by at least one window (200-char overlap so a fact
+                # sitting near a boundary is never split across two windows
+                # and missed by both) — rather than retrieval's 2-window
+                # heuristic guess. Deliberately a separate function, not a
+                # change to _rerank_windows itself — retrieval's own
+                # speed-tuned windowing stays exactly as it is.
+                _PGF_RERANK_WINDOW_CHARS = 400
+                _PGF_RERANK_WINDOW_STRIDE = 200
+
+                def _pgf_rerank_windows(_text: str) -> list:
+                    if len(_text) <= _PGF_RERANK_WINDOW_CHARS:
+                        return [_text]
+                    _windows = []
+                    _start = 0
+                    while True:
+                        _windows.append(_text[_start:_start + _PGF_RERANK_WINDOW_CHARS])
+                        if _start + _PGF_RERANK_WINDOW_CHARS >= len(_text):
+                            break
+                        _start += _PGF_RERANK_WINDOW_STRIDE
+                    return _windows
+
+                def _pgf_context_for_units(_unit_texts: list) -> list:
+                    if not _unit_texts:
+                        return []
+                    if not _pgf_matching_chunks:
+                        return [(None, [])] * len(_unit_texts)
+                    if _pgf_reranker is None:
+                        return [_pgf_word_overlap_order(u) for u in _unit_texts]
+                    try:
+                        if len(_pgf_matching_chunks) > _PGF_PREFILTER_K:
+                            _pgf_pf_embed_model = _get_shared_embed_model(EMBED_MODEL_NAME)
+                            _pgf_pf_chunk_vecs = _pgf_pf_embed_model.encode(
+                                _pgf_matching_chunks, normalize_embeddings=True
+                            )
+                            _pgf_pf_unit_vecs = _pgf_pf_embed_model.encode(
+                                _unit_texts, normalize_embeddings=True
+                            )
+                            _shortlists = []
+                            for _uv in _pgf_pf_unit_vecs:
+                                _sims = [float(np.dot(_uv, _cv)) for _cv in _pgf_pf_chunk_vecs]
+                                _order = sorted(
+                                    range(len(_pgf_matching_chunks)),
+                                    key=lambda i: _sims[i], reverse=True,
+                                )
+                                _shortlists.append(_order[:_PGF_PREFILTER_K])
+                        else:
+                            _shortlists = [list(range(len(_pgf_matching_chunks)))] * len(_unit_texts)
+
+                        _pairs: list = []
+                        _owner: list = []  # (unit_idx, chunk_idx) per pair
+                        for _ui, _unit in enumerate(_unit_texts):
+                            for _ci in _shortlists[_ui]:
+                                for _window in _pgf_rerank_windows(_pgf_matching_chunks[_ci]):
+                                    _pairs.append((_unit, _window))
+                                    _owner.append((_ui, _ci))
+                        _raw_scores = _pgf_reranker.predict(_pairs)
+                    except Exception as _pgf_rerank_exc:
+                        logger.debug(
+                            "[ask_stream] PGF cross-encoder scoring failed, falling back to "
+                            "word overlap for evidence ordering: %s", _pgf_rerank_exc,
+                        )
+                        return [_pgf_word_overlap_order(u) for u in _unit_texts]
+                    _best: dict = {}
+                    for (_ui, _ci), _score in zip(_owner, _raw_scores):
+                        _key = (_ui, _ci)
+                        if _key not in _best or _score > _best[_key]:
+                            _best[_key] = float(_score)
+                    _results = []
+                    for _ui in range(len(_unit_texts)):
+                        _scored = sorted(
+                            ((_ci, _best[(_ui, _ci)]) for _ci in _shortlists[_ui]),
+                            key=lambda x: x[1], reverse=True,
+                        )
+                        _top = [_ci for _ci, _sc in _scored[:_PGF_TOP_K_CHUNKS] if _sc >= _PGF_RERANK_FLOOR]
+                        if not _top:
+                            _results.append((None, []))
+                        else:
+                            _results.append(("\n\n".join(_pgf_matching_chunks[_ci] for _ci in _top), _top))
+                    return _results
+
+                async def _pgf_verify_units(_units: list, _ctxs: list) -> list:
+                    """Only calls the LLM entailment check for units whose
+                    evidence selection actually cleared _PGF_RERANK_FLOOR —
+                    ctx=None means nothing in the whole pool was a real
+                    match, which is an automatic fail, not a coin-flip LLM
+                    call against a weak/irrelevant chunk."""
+                    _idx = [_j for _j, (_ctx, _cited) in enumerate(_ctxs) if _ctx is not None]
+                    _out = await asyncio.gather(*[
+                        _verify_point_faithfulness(_units[_j], _ctxs[_j][0]) for _j in _idx
+                    ])
+                    _results = [False] * len(_units)
+                    for _j, _ok in zip(_idx, _out):
+                        _results[_j] = _ok
+                    return _results
+
+                def _pgf_log_citations(_label: str, _units: list, _ctxs: list, _results: list) -> None:
+                    for _u, (_ctx, _cited), _ok in zip(_units, _ctxs, _results):
+                        if _ctx is None:
+                            _cite_desc = "none (no chunk cleared relevance floor)"
+                        else:
+                            _cite_desc = ", ".join(
+                                f"#{_i}:{_pgf_matching_chunks[_i][:60]!r}" for _i in _cited
+                            ) or "none (unscoped fallback)"
+                        logger.info(
+                            "[ask_stream] PGF citation (%s): unit=%r ok=%s cited_chunk(s)=[%s]",
+                            _label, _u[:70], _ok, _cite_desc,
+                        )
+
+                _pgf_has_points = bool(re.search(r'(?:^|\n)\s*\d+\.\s', _pgf_src))
+                if _pgf_has_points:
+                    _pgf_body, _pgf_signoff = _split_off_signoff(_pgf_src)
+
+                    _pgf_units = re.split(r'\n(?=\s*\d+\.\s)|\n\n+', _pgf_body)
+                    _pgf_point_idx = [i for i, u in enumerate(_pgf_units) if re.match(r'\s*\d+\.\s', u)]
+
+                    if _pgf_point_idx:
+                        _pgf_point_ctxs = _pgf_context_for_units([_pgf_units[i] for i in _pgf_point_idx])
+                        _pgf_results = await _pgf_verify_units(
+                            [_pgf_units[i] for i in _pgf_point_idx], _pgf_point_ctxs,
+                        )
+                        _pgf_log_citations(
+                            "numbered-list", [_pgf_units[i] for i in _pgf_point_idx],
+                            _pgf_point_ctxs, _pgf_results,
+                        )
+                        _pgf_drop = {i for i, ok in zip(_pgf_point_idx, _pgf_results) if not ok}
+
+                        if _pgf_drop:
+                            _pgf_kept = [u for i, u in enumerate(_pgf_units) if i not in _pgf_drop]
+                            _pgf_kept_points = [u for u in _pgf_kept if re.match(r'\s*\d+\.\s', u)]
+                            if _pgf_kept_points:
+                                _pgf_point_re = re.compile(r'^(\s*)(\d+)(\.\s+)(.*)$', re.DOTALL)
+                                _PGF_ORDINAL_LEADIN_RE = re.compile(
+                                    r'^(first|second|third|fourth|fifth|sixth|seventh|'
+                                    r'eighth|ninth|tenth)\b[,:]?\s*',
+                                    re.IGNORECASE,
+                                )
+                                _pgf_renumbered, _pgf_next_n = [], 1
+                                for _u in _pgf_kept:
+                                    _m = _pgf_point_re.match(_u)
+                                    if _m:
+                                        _point_text = _m.group(4)
+                                        if _m.group(2) != str(_pgf_next_n):
+                                            _stripped_text = _PGF_ORDINAL_LEADIN_RE.sub('', _point_text)
+                                            if _stripped_text and _stripped_text != _point_text:
+                                                _point_text = _stripped_text[0].upper() + _stripped_text[1:]
+                                        _pgf_renumbered.append(f"{_m.group(1)}{_pgf_next_n}{_m.group(3)}{_point_text}")
+                                        _pgf_next_n += 1
+                                    else:
+                                        _pgf_renumbered.append(_u)
+                                _pgf_joined = re.sub(r"\n{3,}", "\n\n", "\n".join(_pgf_renumbered)).strip()
+                                if _pgf_signoff:
+                                    _pgf_joined = f"{_pgf_joined}\n{_pgf_signoff}"
+                                _corrected_text = _pgf_joined
+                                _kv_reply = _pgf_joined
+                                logger.warning(
+                                    "[ask_stream] post-generation faithfulness check: dropped %d/%d "
+                                    "unsupported point(s) before SRG runs",
+                                    len(_pgf_drop), len(_pgf_point_idx),
+                                )
+                            else:
+                                # EVERY point independently failed — the
+                                # strongest signal this mechanism can give
+                                # that the whole answer is fabricated. No
+                                # retry mechanism exists in this fork, so
+                                # straight to refusal.
+                                _refusal_text = (
+                                    "Hmm, I don't have that specific information in my knowledge base right now. "
+                                    "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                                )
+                                _corrected_text = _refusal_text
+                                _kv_reply = _refusal_text
+                                _pgf_all_points_hallucinated = True
+                                logger.warning(
+                                    "[ask_stream] post-generation faithfulness check: ALL %d point(s) "
+                                    "failed grounding — refusing instead of showing a fully-unsupported list",
+                                    len(_pgf_point_idx),
+                                )
+                else:
+                    # PROSE path — per-SENTENCE, not whole-block. Reuses the
+                    # exact same _verify_point_faithfulness call the
+                    # numbered-list path above uses — a "point" is just a
+                    # sentence here instead of a numbered line.
+                    _PGF_ABBREV_RE = re.compile(
+                        r'\b(?:Rs|Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|no|vol|'
+                        r'pp|approx|Inc|Ltd|Co|St|Ave|Fig)\.$',
+                        re.IGNORECASE,
+                    )
+
+                    def _pgf_split_sentences(text: str) -> list:
+                        _raw = re.split(r'(?<=[.!?])\s+', text)
+                        _merged = []
+                        for _piece in _raw:
+                            if _merged and _PGF_ABBREV_RE.search(_merged[-1]):
+                                _merged[-1] = f"{_merged[-1]} {_piece}"
+                            else:
+                                _merged.append(_piece)
+                        return _merged
+
+                    _pgf_body2, _pgf_signoff2 = _split_off_signoff(_pgf_src)
+
+                    _PGF_LEADIN_RE = re.compile(
+                        r'^(so|good question|sure thing|right|ah)[,.!]\s*', re.IGNORECASE,
+                    )
+                    _pgf_leadin_m2 = _PGF_LEADIN_RE.match(_pgf_body2)
+                    _pgf_leadin2 = _pgf_leadin_m2.group(0).rstrip() if _pgf_leadin_m2 else ""
+                    _pgf_body2_for_split = _pgf_body2[_pgf_leadin_m2.end():] if _pgf_leadin_m2 else _pgf_body2
+
+                    _pgf_sentences = [s for s in _pgf_split_sentences(_pgf_body2_for_split) if s.strip()]
+
+                    # Worked-example protection: when the user explicitly
+                    # asked for an example, the numbers/scenario the model
+                    # invents to illustrate are EXPECTED — carve that clause
+                    # out before checking, same as the sign-off, and never
+                    # subject it to the faithfulness check at all.
+                    _pgf_example_start_idx = None
+                    if _resolved_has_example:
+                        _pgf_example_marker_re = re.compile(
+                            r'\b(for example|for instance|as an example|to illustrate|'
+                            r"here'?s an example|let'?s say|let us say|say you|"
+                            r'suppose you|imagine you)\b', re.IGNORECASE,
+                        )
+                        for _i, _s in enumerate(_pgf_sentences):
+                            if _pgf_example_marker_re.search(_s.strip()):
+                                _pgf_example_start_idx = _i
+                                break
+
+                    if _pgf_example_start_idx is not None:
+                        _pgf_example_sentences = _pgf_sentences[_pgf_example_start_idx:]
+                        _pgf_sentences = _pgf_sentences[:_pgf_example_start_idx]
+                    else:
+                        _pgf_example_sentences = []
+
+                    if len(_pgf_sentences) >= 1:
+                        _pgf_sent_ctxs = _pgf_context_for_units(_pgf_sentences)
+                        _pgf_sent_results = await _pgf_verify_units(_pgf_sentences, _pgf_sent_ctxs)
+                        _pgf_log_citations("prose-sentence", _pgf_sentences, _pgf_sent_ctxs, _pgf_sent_results)
+                        _pgf_sent_drop = {i for i, ok in enumerate(_pgf_sent_results) if not ok}
+
+                        # Claim-extraction SALVAGE for sentences that failed
+                        # the whole-sentence check above.
+                        _pgf_salvaged = 0
+                        for _i in list(_pgf_sent_drop):
+                            _pgf_orig_sentence = _pgf_sentences[_i]
+                            _claims = await _pgf_extract_claims(_pgf_orig_sentence)
+                            if not _claims:
+                                continue
+                            _claim_ctxs = _pgf_context_for_units(_claims)
+                            _claim_results = await _pgf_verify_units(_claims, _claim_ctxs)
+                            _pgf_log_citations("salvage-claim", _claims, _claim_ctxs, _claim_results)
+                            _surviving = [c for c, ok in zip(_claims, _claim_results) if ok]
+                            if _surviving and len(_surviving) < len(_claims):
+                                _stripped_claims = [
+                                    c.strip().rstrip(".!?").strip() for c in _surviving
+                                ]
+                                _pgf_sentences[_i] = ". ".join(c for c in _stripped_claims if c).strip()
+                                if not _pgf_sentences[_i].endswith((".", "!", "?")):
+                                    _pgf_sentences[_i] += "."
+                                _pgf_sent_drop.discard(_i)
+                                _pgf_salvaged += 1
+
+                        if _pgf_sent_drop or _pgf_salvaged:
+                            _pgf_sent_kept = [
+                                s for i, s in enumerate(_pgf_sentences) if i not in _pgf_sent_drop
+                            ]
+                            if _pgf_sent_kept:
+                                _pgf_sent_kept = _pgf_sent_kept + _pgf_example_sentences
+                                _pgf_joined2 = " ".join(_pgf_sent_kept).strip()
+                                if _pgf_leadin2:
+                                    _pgf_joined2 = f"{_pgf_leadin2} {_pgf_joined2}"
+                                if _pgf_signoff2:
+                                    _pgf_joined2 = f"{_pgf_joined2} {_pgf_signoff2}"
+                                _corrected_text = _pgf_joined2
+                                _kv_reply = _pgf_joined2
+                                logger.warning(
+                                    "[ask_stream] post-generation faithfulness check: dropped %d/%d "
+                                    "unsupported sentence(s) (prose, %d salvaged via claim-splitting) "
+                                    "before SRG runs",
+                                    len(_pgf_sent_drop), len(_pgf_sentences), _pgf_salvaged,
+                                )
+                            else:
+                                # Same as the numbered-list path above: every
+                                # CHECKED sentence independently failed
+                                # grounding and nothing was salvageable, and
+                                # no retry mechanism exists in this fork —
+                                # straight to refusal.
+                                _refusal_text = (
+                                    "Hmm, I don't have that specific information in my knowledge base right now. "
+                                    "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                                )
+                                _corrected_text = _refusal_text
+                                _kv_reply = _refusal_text
+                                _pgf_all_points_hallucinated = True
+                                logger.warning(
+                                    "[ask_stream] post-generation faithfulness check: ALL %d checked "
+                                    "sentence(s) (prose) failed grounding — refusing instead of showing "
+                                    "a fully-unsupported answer",
+                                    len(_pgf_sentences),
+                                )
+        except Exception as _pgf_exc:
+            logger.debug("[ask_stream] post-generation faithfulness check skipped: %s", _pgf_exc)
 
         # ── Specificity Recall Guard (SRG, ported from Layla, current ─────────
         # post-2026-09-07 state; structural pattern cross-checked against

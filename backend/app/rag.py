@@ -342,7 +342,12 @@ class RAGPipeline:
         _redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
         self._cache = QueryKVCache(
             redis_url=_redis_url,
-            ttl_seconds=int(os.getenv("KV_CACHE_TTL", "3600")),
+            # 3600 (1h) -> 86400 (24h), 2026-09-09 — ported from Layla/
+            # InsureHub-RAG-main, paired with kv_cache.py's switch to a
+            # SLIDING window (see QueryKVCache's own docstring/comments) —
+            # an entry now only expires after 24h with zero hits from ANY
+            # user, not 1h from creation regardless of use.
+            ttl_seconds=int(os.getenv("KV_CACHE_TTL", "86400")),
             max_entries=int(os.getenv("KV_CACHE_MAX_ENTRIES", "500")),
             sem_threshold=float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92")),
         )
