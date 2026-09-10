@@ -15,9 +15,15 @@ as a mistake worth not repeating here, and asked for a different strategy:
      distance distribution (a document whose sentences are naturally more
      varied gets a proportionally looser split threshold than a uniform
      one) — split wherever a pair's distance exceeds it.
-  5. Enforce a 500-token ceiling per chunk and a 50-token overlap between
-     consecutive chunks, both counted with tiktoken (cl100k_base) rather
-     than word/char counts.
+  5. Enforce a 500-token ceiling per chunk (tiktoken/cl100k_base), and
+     carry the LAST FULL SENTENCE of each chunk forward as a one-sentence
+     overlap prefix on the next chunk (2026-09-10 — replaced a fixed
+     50-token tail, which sliced raw tokens with no regard for sentence
+     boundaries and could hand the next chunk half of a sentence, or a
+     meaningless token fragment, instead of real leading context. Reuses
+     _split_sentences, the same sentence-splitter Step 1 already applies
+     to the whole document, so the overlap is always a complete,
+     grammatical sentence rather than an arbitrary token slice).
 
 Originally shipped without any of SectionChunker's heading-detection or
 per-section policy_type classification, on the reasoning that none of it
@@ -116,7 +122,7 @@ logger = logging.getLogger(__name__)
 
 # ── Tuning ────────────────────────────────────────────────────────────────
 MAX_CHUNK_TOKENS = 500
-OVERLAP_TOKENS = 50
+OVERLAP_SENTENCES = 1
 BREAKPOINT_PERCENTILE = 95.0
 _MIN_SENTENCE_CHARS = 2
 _WORD_WINDOW_SIZE = 20  # fallback granularity for punctuation-free text (raw transcripts)
@@ -163,6 +169,19 @@ def _count_tokens(text: str) -> int:
 _ABBREVIATIONS = frozenset({
     "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "vs", "etc", "eg", "ie",
     "e.g", "i.e", "u.s", "u.k", "no", "fig", "approx", "inc", "ltd", "co", "st",
+    # Currency/regulatory abbreviations common in Indian insurance
+    # documents (2026-09-10, found via live testing): "Rs." immediately
+    # followed by a figure — "(Rs. 25,00,000)" — matches the split
+    # regex's own trigger (period, space, then a digit) just as reliably
+    # as any sentence boundary does, incorrectly cutting a monetary
+    # figure away from the clause introducing it. Confirmed live: this
+    # silently split "...a sub-limit of twenty-five lakh rupees (Rs." from
+    # "25,00,000) per Policy Period, which sub-limit forms part of..." —
+    # two fake "sentences" with the actual number orphaned at the start of
+    # the second one, undermining even the one-sentence overlap fix (an
+    # overlap can only carry forward a REAL last sentence; it can't fix a
+    # sentence that was never really one boundary to begin with).
+    "rs",
 })
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])")
 
@@ -179,7 +198,12 @@ def _split_sentences(text: str) -> List[str]:
     buf = ""
     for piece in raw_pieces:
         buf = f"{buf} {piece}".strip() if buf else piece
-        last_word = re.split(r"\s+", buf)[-1].rstrip(".").lower()
+        # Strip leading punctuation too, not just trailing (2026-09-10,
+        # found alongside the "Rs." gap above) — a parenthesized
+        # abbreviation like "(Rs." left the leading "(" attached, so the
+        # lookup compared "(rs" against the abbreviations set instead of
+        # "rs" and never matched, even once "rs" was added to the set.
+        last_word = re.sub(r"[^a-z.]", "", re.split(r"\s+", buf)[-1].lower()).rstrip(".")
         if last_word in _ABBREVIATIONS:
             continue  # false split after an abbreviation — keep accumulating
         sentences.append(buf)
@@ -661,12 +685,12 @@ class SentenceSemanticChunker:
         self,
         embed_model: Any = None,
         max_chunk_tokens: int = MAX_CHUNK_TOKENS,
-        overlap_tokens: int = OVERLAP_TOKENS,
+        overlap_sentences: int = OVERLAP_SENTENCES,
         breakpoint_percentile: float = BREAKPOINT_PERCENTILE,
     ):
         self._model = embed_model
         self._max_tokens = max_chunk_tokens
-        self._overlap_tokens = overlap_tokens
+        self._overlap_sentences = overlap_sentences
         self._breakpoint_percentile = breakpoint_percentile
 
     def _model_or_default(self) -> Any:
@@ -763,16 +787,30 @@ class SentenceSemanticChunker:
         )
         return chunks, chunk_pages, chunk_headings, chunk_sub_headings, chunk_ids
 
-    # ── Step 5b: 50-token overlap between consecutive chunks ────────────────
+    # ── Step 5b: N-sentence overlap between consecutive chunks ──────────────
+    # 2026-09-10, user's explicit direction: replaced a fixed 50-TOKEN tail
+    # (a raw tiktoken slice with no regard for sentence boundaries) with a
+    # fixed number of COMPLETE trailing sentences instead. Confirmed live
+    # this matters, not just theoretical: a real ingested test document's
+    # own dense, multi-item paragraph got its "Cyber Extortion" clause
+    # split exactly at a chunk boundary — the chunk ending there carried
+    # the concept ("...third party threatening to release, damage, or deny
+    # access to the Insured's") but the token-based overlap tail, sliced
+    # with no sentence awareness, didn't reliably carry that whole
+    # sentence forward, so the NEXT chunk (which had the actual number)
+    # started mid-sentence with no self-contained context of its own.
+    # Reusing _split_sentences (the same splitter Step 1 already applies to
+    # the whole document) means the carried-forward text is always a
+    # complete, grammatical sentence — never a half-sentence or a
+    # meaningless token fragment — giving the next chunk genuine standalone
+    # context for whatever fact its own primary content continues.
     def _apply_overlap(self, chunks: List[str]) -> List[str]:
-        if self._overlap_tokens <= 0 or len(chunks) <= 1:
+        if self._overlap_sentences <= 0 or len(chunks) <= 1:
             return chunks
-        tokenizer = _get_tokenizer()
         result: List[str] = [chunks[0]]
         for i in range(1, len(chunks)):
-            prev_tokens = tokenizer.encode(chunks[i - 1])
-            tail_tokens = prev_tokens[-self._overlap_tokens:]
-            tail = tokenizer.decode(tail_tokens).strip()
+            prev_sentences = _split_sentences(chunks[i - 1])
+            tail = " ".join(prev_sentences[-self._overlap_sentences:]).strip()
             current = chunks[i]
             # Skip overlap if the next chunk already starts with the same
             # content (consecutive pages sometimes repeat boundary text).
