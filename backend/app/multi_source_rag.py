@@ -5738,6 +5738,74 @@ async def _verify_point_faithfulness(point: str, context: str) -> bool:
     return _groq_verdict is not False
 
 
+async def _synthesize_from_dominant_chunk(question: str, chunk_text: str) -> Optional[str]:
+    """Last resort when both a generation attempt AND its post-hallucination
+    retry produced an answer that failed grounding entirely, but ONE
+    retrieved chunk dominates the ranked pool by a wide, unambiguous
+    margin — synthesize the answer directly from that chunk's own literal
+    text instead of trusting either LLM attempt's own framing.
+
+    Confirmed live (2026-09-11, rag_site_2): a cyber-liability query
+    asking whether a ransom payment is covered had its single best-
+    matching chunk score ~0.98-1.0 (next-best chunk under 0.85 — a clear,
+    unambiguous match) and state affirmative coverage terms plainly, yet
+    BOTH the original generation and its retry inverted the polarity to
+    "not covered" on independent samples. Traced to the model (a
+    quantized 7B model on this fork) reading a NESTED exception sub-
+    heading elsewhere in context ("2.2 Excluded Extortion Scenarios") and
+    collapsing the parent section's own general "covered subject to
+    conditions" statement into a blanket denial — a multi-step
+    conditional-reasoning task this size of model doesn't reliably get
+    right regardless of how the prompt is worded (two rounds of prompt
+    rule fixes and a resampling retry all failed to fully resolve it).
+
+    Rather than keep resampling the same biased multi-step reasoning
+    step, this asks for a much NARROWER task instead: rephrase ONE
+    already-selected passage in plain warm sentences, nothing else — a
+    task small models are far more reliable at than judging which of
+    several nearby headings actually governs a given statement. Verified
+    by re-running the exact same per-claim entailment check the rest of
+    PGF already uses (_verify_point_faithfulness) against the SAME
+    passage it was built from, so a rewrite that still drifted despite
+    the instruction gets caught and discarded rather than shown.
+    """
+    if not chunk_text or not chunk_text.strip() or not question or not question.strip():
+        return None
+    try:
+        from prompt_template import PERSONA_NAME
+        prompt = (
+            f"You are {PERSONA_NAME}, a warm, caring assistant.\n"
+            "Rewrite ONLY the passage below into 1-3 short, warm, plain-English "
+            "sentences that directly answer the question. Do not add any fact, "
+            "condition, number, or exclusion that isn't literally stated in the "
+            "passage. Do not add a caveat or exception the passage doesn't itself "
+            "state, even one that sounds plausible for this kind of policy. Keep "
+            "the EXACT same polarity as the passage — if it says something IS "
+            "covered/permitted, your answer must also say it IS covered/permitted, "
+            "just worded plainly; never invert it into a denial, and never state "
+            "a denial the passage doesn't itself state.\n\n"
+            f"PASSAGE:\n{chunk_text[:1500]}\n\n"
+            f"QUESTION: {question[:400]}\n\n"
+            "ANSWER (plain warm sentences, only from the passage above, no "
+            "sign-off, no lead-in like \"Sure thing\"):"
+        )
+        raw = await _backend_completion(prompt, max_tokens=220, timeout=20.0)
+        if not raw or not raw.strip():
+            return None
+        candidate = raw.strip()
+        _ok = await _verify_point_faithfulness(candidate, chunk_text)
+        if not _ok:
+            logger.warning(
+                "[ask_stream] dominant-chunk synthesis failed its own entailment "
+                "check against the source passage — discarding"
+            )
+            return None
+        return candidate
+    except Exception as _synth_exc:
+        logger.warning("[ask_stream] dominant-chunk synthesis failed: %s", _synth_exc)
+        return None
+
+
 _PGF_CLAIMS_PROMPT = (
     'Based on the given text, extract a list of separate FACTUAL claims made in it. '
     'Split any sentence that bundles more than one distinct fact into separate claims, '
@@ -6678,12 +6746,28 @@ class MultiSourceRAG:
         question: str,
         history: str = "",
         document_filter: Optional[List[str]] = None,
+        _is_retry: bool = False,
+        _widen_retrieval: bool = False,
     ):
         """Async generator — yields text tokens as the LLM produces them.
 
         Runs all retrieval logic identically to ask(), then streams the LLM
         response token-by-token so the frontend can show words appearing live
         instead of waiting for the full answer.
+
+        `_is_retry`/`_widen_retrieval` are internal-only, set by
+        `_retry_after_full_hallucination` (ported from rag_site_1 2026-09-11
+        after a live-confirmed gap: a real query got PGF/denial-claim-
+        mismatch dropping every point of an answer that inverted a clearly-
+        covered fact, 3+ times in a row on independent samples, with no
+        retry mechanism to give generation a second independent attempt —
+        this fork had none, unlike Layla and rag_site_1). `_is_retry=True`
+        caps recursion at one retry and skips the cache lock (a retry call
+        always wants fresh generation). `_widen_retrieval=True` doubles the
+        pre-rerank candidate pool on retry — unlike Layla, this fork has no
+        policy_type filter to loosen, so without widening, a retry's
+        deterministic (temperature=0) query reformulation would re-rank the
+        exact same narrow candidate pool and likely fail the same way again.
 
         Yields:
             str tokens as they arrive, then a final JSON line:
@@ -7156,6 +7240,17 @@ class MultiSourceRAG:
         # silently dropping a correct-but-differently-worded chunk before
         # the reranker ever gets a chance to judge it.
         _doc_top_k   = 18 if _keyword_detailed else 12
+        # Doubled on a post-hallucination retry (2026-09-11, ported from
+        # rag_site_1) — this fork has no policy_type filter to loosen on
+        # retry (ENABLE_METADATA_FILTERING is off), so _is_retry alone would
+        # give the retry attempt zero retrieval diversity: the retry's own
+        # reformulation call is deterministic (temperature=0) and produces
+        # the same retrieval_query both times, re-ranking the exact same
+        # narrow candidate pool and likely failing the same way again.
+        # Widening the pre-rerank pool gives the retry a real chance to
+        # surface a chunk the first pass's narrower cut excluded.
+        if _widen_retrieval:
+            _doc_top_k = _doc_top_k * 2
         # Trimmed 12/8 -> 8/5 (2026-07-13) — the final merged-and-reranked
         # pool actually sent to the LLM, kept deliberately separate from
         # _doc_top_k/_media_top_k above (which stay wide so the reranker
@@ -7492,19 +7587,19 @@ class MultiSourceRAG:
         # for or adopt anyone else's cached answer. See QueryKVCache.
         # try_acquire_generation_lock / wait_for_generation for the fail-open
         # and self-healing behavior.
-        # NOTE (2026-09-10): Layla and rag_site_1 also guard this on
-        # `not _is_retry`, to protect against a recursive post-hallucination
-        # retry deadlocking against its own outer call's lock — see their
-        # own comments here for the full story. This fork has no such
-        # retry mechanism (no _retry_after_full_hallucination, no _is_retry
-        # parameter on ask_stream at all — confirmed, ask_stream never
-        # calls itself recursively here), so that specific collision can't
-        # happen and the guard doesn't apply. An earlier version of this
-        # comment/guard referenced `_is_retry` anyway, copied verbatim from
-        # site_1 without checking it actually existed in this file — a
-        # real bug (NameError on every cache-miss request) caught before
-        # ever reaching a live user.
-        if _kv_hit is None and not _disable_query_cache and not _bypass_cache_for_chip_click:
+        # UPDATE (2026-09-11): this fork now HAS the retry mechanism (see
+        # _retry_after_full_hallucination below, ported from rag_site_1),
+        # so this guard is real again — without `not _is_retry` here, a
+        # recursive retry call would try to acquire the SAME _kv_key lock
+        # its own outer call already holds (the outer call is synchronously
+        # awaiting this very recursive call), and poll for up to the full
+        # wait timeout for a cache write that can only land once the outer
+        # call returns. Self-resolving, not a true deadlock, but a real
+        # latency regression — see Layla/rag_site_1's own identical guard.
+        if (
+            _kv_hit is None and not _disable_query_cache
+            and not _bypass_cache_for_chip_click and not _is_retry
+        ):
             if await asyncio.to_thread(_kv.try_acquire_generation_lock, _kv_key):
                 logger.info("[ask_stream] cache-lock acquired, generating: %r", retrieval_query[:80])
             else:
@@ -8566,6 +8661,14 @@ class MultiSourceRAG:
         _full_context_uncompressed_chunks = [
             (c.page_content, c.metadata.get("section_heading", ""), c.metadata.get("policy_type", ""))
             for c in all_chunks
+        ]
+        # Parallel-indexed scores (kept separate from the tuple above —
+        # that shape is unpacked elsewhere as (text, heading, policy_type)
+        # and a 4th element would break that). Used by the dominant-chunk
+        # fallback synthesis (see _synthesize_from_dominant_chunk) to find
+        # whether one chunk clearly outranks the rest of the pool.
+        _full_context_uncompressed_scores = [
+            c.metadata.get("rerank_score", c.metadata.get("similarity", 0.0)) for c in all_chunks
         ]
 
         total_retrieved_chars = sum(len(c.page_content) for c in all_chunks)
@@ -11471,6 +11574,30 @@ class MultiSourceRAG:
                 r"not\s+payable|no\s+coverage",
                 _re7.IGNORECASE,
             )
+            # A bare structural cross-reference to "exclusions" isn't
+            # exclusion CONTENT — confirmed live 2026-09-11: a cyber policy's
+            # own opening "Insuring Clause" ("...subject to the terms,
+            # conditions, limits, and exclusions set out below") matched
+            # _EXCLUSION_INDICATOR_RE and, since "limits" (from the
+            # question's own scenario words) sits right next to it, this
+            # made a totally unrelated denial claim look grounded — the
+            # real exclusion clause elsewhere in the document (naming the
+            # actual excluded scenarios) had ZERO scenario-word overlap
+            # with the question, and would correctly have failed the check
+            # on its own. This near-universal insurance-boilerplate shape
+            # (a coordinate noun list ending in "exclusions set out
+            # below/herein/elsewhere", or "subject to the terms... and
+            # exclusions") names the CONCEPT of exclusions existing
+            # somewhere in the document without stating what's excluded —
+            # a recognizable document-structure pattern, not scenario-
+            # specific whack-a-mole, so skipping it doesn't weaken the
+            # check's ability to catch a genuine mismatch elsewhere.
+            _EXCLUSION_CROSS_REF_RE = _re7.compile(
+                r"(?:terms,?\s+)?(?:conditions,?\s+)?(?:limits,?\s+)?and\s+exclu\w*\s+set\s+out|"
+                r"exclu\w*\s+set\s+out\s+(?:below|herein|elsewhere)|"
+                r"subject\s+to\s+the\s+(?:policy'?s?\s+)?terms(?:,?\s+conditions)?(?:,?\s+and)?\s+exclu\w*",
+                _re7.IGNORECASE,
+            )
             # Generic insurance vocabulary (already maintained for the
             # hollow-answer detector) plus ordinary English function words —
             # what's left after stripping both is the part of the question
@@ -11553,6 +11680,9 @@ class MultiSourceRAG:
                 _any_compatible_denial_src = False
                 _any_exclusion_context = False
                 for _m in _EXCLUSION_INDICATOR_RE.finditer(_full_context_uncompressed or ''):
+                    _match_local = _full_context_uncompressed[max(0, _m.start() - 40):_m.end() + 40]
+                    if _EXCLUSION_CROSS_REF_RE.search(_match_local):
+                        continue
                     _any_exclusion_context = True
                     _window = _full_context_uncompressed[max(0, _m.start() - 300):_m.end() + 300]
                     _window_words = _denial_scenario_words(_window)
@@ -12271,11 +12401,19 @@ class MultiSourceRAG:
         # unit) and no decision-query "survivor names the policy type"
         # hollow-check (insurance-keyword-coupled, doesn't apply here).
         #
-        # Unlike Layla/rag_site_1, this fork has NO post-hallucination
-        # retry mechanism (ask_stream has no _is_retry/_widen_retrieval
-        # parameter) — when every point/sentence fails, this goes straight
-        # to refusal rather than attempting a recursive retry, matching
-        # this file's own established absence of that mechanism elsewhere.
+        # UPDATE (2026-09-11): ported from rag_site_1 after a live-confirmed
+        # gap — a real cyber-liability query ("if we pay a ransom... is that
+        # covered, and are there limits...") got every point of the answer
+        # dropped as unsupported 4+ times across independent samples, even
+        # though the single highest-scoring retrieved chunk (score ~0.98-1.0)
+        # plainly stated the opposite, affirmative fact ("...are covered
+        # subject to a sub-limit of twenty-five percent (25%)..."). With no
+        # retry mechanism, every one of those failed samples went straight
+        # to a refusal the user didn't need to see, since a fresh
+        # independent generation attempt succeeded on other samples of the
+        # exact same query. See _retry_after_full_hallucination below and
+        # its two call sites (numbered-list and prose "every point/sentence
+        # failed" branches).
         #
         # Evidence selection uses a cross-encoder + relevance floor from
         # the start (not the earlier bi-encoder-cosine version Layla/site_1
@@ -12292,6 +12430,132 @@ class MultiSourceRAG:
         # each unit to its top 5 candidates before the (much more
         # expensive, ~0.22s/pair) cross-encoder scores them, bounding cost
         # by unit count rather than pool size.
+        #
+        # When every point/sentence fails, don't just refuse but also don't
+        # hand-build a parallel retry pipeline — recursively call THIS SAME
+        # ask_stream with the same question, guarded by _is_retry=True to
+        # cap recursion at one retry (ported verbatim from rag_site_1).
+        async def _retry_after_full_hallucination(_shape: str) -> "Optional[tuple[str, list]]":
+            """Returns (answer_text, sources) on a successful retry, or None
+            if the retry also failed — sources come from the retry's own
+            fresh retrieval, not the original failed attempt's.
+            """
+            if _is_retry:
+                return None
+            try:
+                import json as _json_retry
+                _retry_pieces: List[str] = []
+                _retry_final_payload = None
+                async for _piece in self.ask_stream(
+                    question, history=history, document_filter=document_filter, _is_retry=True,
+                    _widen_retrieval=True,
+                ):
+                    if isinstance(_piece, str) and _piece.startswith("\n\n{"):
+                        try:
+                            _retry_final_payload = _json_retry.loads(_piece[2:])
+                        except Exception:
+                            _retry_final_payload = None
+                    else:
+                        _retry_pieces.append(_piece)
+                if _retry_final_payload is None:
+                    logger.warning(
+                        "[ask_stream] post-hallucination retry (%s path): recursive call produced no final payload",
+                        _shape,
+                    )
+                    return None
+                _retry_answer = (_retry_final_payload.get("corrected_text") or "".join(_retry_pieces)).strip()
+                if (
+                    not _retry_answer
+                    or _retry_final_payload.get("needs_human")
+                    or _retry_answer.lower().startswith("hmm, i don't have")
+                ):
+                    logger.warning(
+                        "[ask_stream] post-hallucination retry (%s path): fresh full-pipeline attempt "
+                        "ALSO came back unanswerable — falling through to refusal", _shape,
+                    )
+                    return None
+                logger.info(
+                    "[ask_stream] post-hallucination retry (%s path): fresh full-pipeline attempt "
+                    "succeeded, using it instead of refusing", _shape,
+                )
+                return _retry_answer, (_retry_final_payload.get("sources") or [])
+            except Exception as _retry_exc:
+                logger.warning(
+                    "[ask_stream] post-hallucination retry (%s path) failed with an exception "
+                    "(not a genuine second hallucination): %s", _shape, _retry_exc,
+                )
+                return None
+
+        # Absolute last resort, tried only after BOTH the original
+        # generation AND its retry have failed — if one retrieved chunk (or
+        # a tight cluster of top chunks that are really the SAME section's
+        # own content) dominates the ranked pool by a wide, unambiguous
+        # margin, synthesize the answer directly from that literal text
+        # rather than showing a bare refusal when the KB plainly had a
+        # directly relevant answer the whole time. See
+        # _synthesize_from_dominant_chunk's own docstring for the
+        # confirmed live case this exists for.
+        #
+        # Groups the top chunks together first (2026-09-11 fix, confirmed
+        # live) rather than comparing only chunk[0] vs chunk[1] — a
+        # section's own body chunk and its own sub-heading's chunk (e.g.
+        # "2. Sub-limits..." and "2.1 Pre-Approval Requirement" under it)
+        # score nearly identically (0.002 apart) when both are genuinely
+        # about the question, which the original single-pair comparison
+        # misread as "no dominant chunk, too ambiguous" and never fired at
+        # all. These aren't competing candidates, they're the SAME
+        # section's own complementary parts — grouped together (same
+        # section_heading, OR within a tight score band of the top score)
+        # and used TOGETHER, with the real dominance check applied at the
+        # boundary between this group and whatever comes after it.
+        _DOMINANT_CHUNK_FLOOR = 0.85
+        _DOMINANT_CHUNK_MARGIN = 0.15
+        _DOMINANT_GROUP_BAND = 0.05
+
+        async def _try_dominant_chunk_fallback(_shape: str) -> "Optional[tuple[str, list]]":
+            if not _full_context_uncompressed_chunks or not _full_context_uncompressed_scores:
+                return None
+            _top_score = _full_context_uncompressed_scores[0]
+            if _top_score < _DOMINANT_CHUNK_FLOOR:
+                logger.info(
+                    "[ask_stream] dominant-chunk fallback (%s path): top score too low "
+                    "(top=%.3f) — not attempting", _shape, _top_score,
+                )
+                return None
+            _top_heading = _full_context_uncompressed_chunks[0][1]
+            _group_texts = [_full_context_uncompressed_chunks[0][0]]
+            _group_end_idx = 0
+            for _i in range(1, len(_full_context_uncompressed_chunks)):
+                _score = _full_context_uncompressed_scores[_i]
+                _heading = _full_context_uncompressed_chunks[_i][1]
+                if _heading == _top_heading or (_top_score - _score) < _DOMINANT_GROUP_BAND:
+                    _group_texts.append(_full_context_uncompressed_chunks[_i][0])
+                    _group_end_idx = _i
+                else:
+                    break
+            _next_score = (
+                _full_context_uncompressed_scores[_group_end_idx + 1]
+                if _group_end_idx + 1 < len(_full_context_uncompressed_scores) else 0.0
+            )
+            _group_floor_score = _full_context_uncompressed_scores[_group_end_idx]
+            if (_group_floor_score - _next_score) < _DOMINANT_CHUNK_MARGIN:
+                logger.info(
+                    "[ask_stream] dominant-chunk fallback (%s path): dominant group not "
+                    "separated enough from the rest of the pool (group_floor=%.3f, next=%.3f) "
+                    "— not attempting", _shape, _group_floor_score, _next_score,
+                )
+                return None
+            _combined_text = "\n\n".join(dict.fromkeys(_group_texts))
+            _synth = await _synthesize_from_dominant_chunk(question, _combined_text)
+            if not _synth:
+                return None
+            logger.warning(
+                "[ask_stream] dominant-chunk fallback (%s path): synthesized from %d dominant "
+                "chunk(s) (top=%.3f, group_floor=%.3f, margin over rest=%.3f) after retry also failed",
+                _shape, len(_group_texts), _top_score, _group_floor_score, _group_floor_score - _next_score,
+            )
+            return _synth, unique_sources
+
         _pgf_all_points_hallucinated = False
         try:
             _pgf_enabled = os.getenv("ENABLE_POSTGEN_FAITHFULNESS_CHECK", "false").strip().lower() in ("1", "true", "yes")
@@ -12556,21 +12820,36 @@ class MultiSourceRAG:
                             else:
                                 # EVERY point independently failed — the
                                 # strongest signal this mechanism can give
-                                # that the whole answer is fabricated. No
-                                # retry mechanism exists in this fork, so
-                                # straight to refusal.
-                                _refusal_text = (
-                                    "Hmm, I don't have that specific information in my knowledge base right now. "
-                                    "Let me get one of our agents on it, they'll be able to help you better! 😊"
-                                )
-                                _corrected_text = _refusal_text
-                                _kv_reply = _refusal_text
-                                _pgf_all_points_hallucinated = True
-                                logger.warning(
-                                    "[ask_stream] post-generation faithfulness check: ALL %d point(s) "
-                                    "failed grounding — refusing instead of showing a fully-unsupported list",
-                                    len(_pgf_point_idx),
-                                )
+                                # that the whole answer is fabricated. Before
+                                # refusing: one fresh retry (fresh retrieval
+                                # + fresh generation, re-checked the same
+                                # way) — see _retry_after_full_hallucination.
+                                _retry_result = await _retry_after_full_hallucination("numbered-list")
+                                if not _retry_result:
+                                    _retry_result = await _try_dominant_chunk_fallback("numbered-list")
+                                if _retry_result:
+                                    _corrected_text, _retry_sources = _retry_result
+                                    _kv_reply = _corrected_text
+                                    if _retry_sources:
+                                        unique_sources = list(dict.fromkeys(_retry_sources))
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: ALL %d point(s) "
+                                        "failed grounding — rescued instead of refusing",
+                                        len(_pgf_point_idx),
+                                    )
+                                else:
+                                    _refusal_text = (
+                                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                                    )
+                                    _corrected_text = _refusal_text
+                                    _kv_reply = _refusal_text
+                                    _pgf_all_points_hallucinated = True
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: ALL %d point(s) "
+                                        "failed grounding — refusing instead of showing a fully-unsupported list",
+                                        len(_pgf_point_idx),
+                                    )
                 else:
                     # PROSE path — per-SENTENCE, not whole-block. Reuses the
                     # exact same _verify_point_faithfulness call the
@@ -12676,22 +12955,35 @@ class MultiSourceRAG:
                             else:
                                 # Same as the numbered-list path above: every
                                 # CHECKED sentence independently failed
-                                # grounding and nothing was salvageable, and
-                                # no retry mechanism exists in this fork —
-                                # straight to refusal.
-                                _refusal_text = (
-                                    "Hmm, I don't have that specific information in my knowledge base right now. "
-                                    "Let me get one of our agents on it, they'll be able to help you better! 😊"
-                                )
-                                _corrected_text = _refusal_text
-                                _kv_reply = _refusal_text
-                                _pgf_all_points_hallucinated = True
-                                logger.warning(
-                                    "[ask_stream] post-generation faithfulness check: ALL %d checked "
-                                    "sentence(s) (prose) failed grounding — refusing instead of showing "
-                                    "a fully-unsupported answer",
-                                    len(_pgf_sentences),
-                                )
+                                # grounding and nothing was salvageable —
+                                # one fresh retry before refusing.
+                                _retry_result = await _retry_after_full_hallucination("prose")
+                                if not _retry_result:
+                                    _retry_result = await _try_dominant_chunk_fallback("prose")
+                                if _retry_result:
+                                    _corrected_text, _retry_sources = _retry_result
+                                    _kv_reply = _corrected_text
+                                    if _retry_sources:
+                                        unique_sources = list(dict.fromkeys(_retry_sources))
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: ALL %d checked "
+                                        "sentence(s) (prose) failed grounding — rescued instead of refusing",
+                                        len(_pgf_sentences),
+                                    )
+                                else:
+                                    _refusal_text = (
+                                        "Hmm, I don't have that specific information in my knowledge base right now. "
+                                        "Let me get one of our agents on it, they'll be able to help you better! 😊"
+                                    )
+                                    _corrected_text = _refusal_text
+                                    _kv_reply = _refusal_text
+                                    _pgf_all_points_hallucinated = True
+                                    logger.warning(
+                                        "[ask_stream] post-generation faithfulness check: ALL %d checked "
+                                        "sentence(s) (prose) failed grounding — refusing instead of showing "
+                                        "a fully-unsupported answer",
+                                        len(_pgf_sentences),
+                                    )
         except Exception as _pgf_exc:
             logger.debug("[ask_stream] post-generation faithfulness check skipped: %s", _pgf_exc)
 
