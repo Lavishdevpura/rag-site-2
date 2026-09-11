@@ -185,6 +185,31 @@ _ABBREVIATIONS = frozenset({
 })
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])")
 
+# A markdown heading line (from pymupdf4llm's PDF conversion) never merges
+# with its neighbors, on EITHER side, regardless of punctuation —
+# _SENTENCE_SPLIT_RE's lookahead only fires when the very next character
+# is uppercase/digit/quote, and "#" isn't one, so a heading immediately
+# following body text that ends in a period silently glued onto that body
+# text; the heading's own text rarely ends in real sentence-final
+# punctuation either, so its following paragraph glued on too. Confirmed
+# live 2026-09-11 on both rag_site_1's and rag_site_2's real test
+# documents: "...within the same policy period. \n\n## **2.1 Reinstatement
+# Premium Calculation** \n\nThe reinstatement premium payable is..." merged
+# into ONE 92-word "sentence" — which then fed _assign_section_ids a
+# single word_cursor-START-based heading/sub_heading tag for the whole
+# thing, so downstream chunks ended up mislabeled by one real sentence
+# relative to their actual content (a chunk tagged sub_heading="2.1" held
+# 2.2's own heading and definition instead; on rag_site_2's shorter test
+# document this fully swallowed both 2.1 and 2.2 into one merged
+# "sentence", losing sub_heading entirely). Isolating heading lines BEFORE
+# the punctuation-based regex runs (rather than widening that regex's
+# lookahead) is required because the case on the OTHER side of a heading
+# — a heading's own text not being followed by sentence-final punctuation
+# before its section's first real sentence — can't be expressed as a
+# lookahead/lookbehind fix at all (Python's re requires fixed-width
+# lookbehind, and a heading line has no fixed width).
+_MD_HEADING_LINE_RE = re.compile(r"^#{1,6}\s+.*$", re.MULTILINE)
+
 
 def _split_sentences(text: str) -> List[str]:
     """Split *text* into sentences. Falls back to fixed word windows when
@@ -193,7 +218,16 @@ def _split_sentences(text: str) -> List[str]:
     if not text:
         return []
 
-    raw_pieces = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    _segments = _MD_HEADING_LINE_RE.split(text)
+    _heading_lines = _MD_HEADING_LINE_RE.findall(text)
+    raw_pieces: List[str] = []
+    for _idx, _seg in enumerate(_segments):
+        _seg = _seg.strip()
+        if _seg:
+            raw_pieces.extend(p.strip() for p in _SENTENCE_SPLIT_RE.split(_seg) if p.strip())
+        if _idx < len(_heading_lines):
+            raw_pieces.append(_heading_lines[_idx].strip())
+
     sentences: List[str] = []
     buf = ""
     for piece in raw_pieces:
@@ -561,12 +595,25 @@ def _md_structure_boundaries(full_text: str) -> tuple:
     # legitimately opens on page 1 doesn't lose it, and this can't strip
     # real content no matter how many near-start duplicates a title
     # happens to render as.
+    # Bug found live (2026-09-11 on rag_site_1's identical shared logic,
+    # ported here): the condition above only checked WHERE a heading sat
+    # (early), never WHETHER it actually duplicated anything — so on a
+    # document whose genuine first section is also short (normal for any
+    # doc with a brief intro), this walked straight past the real
+    # cover-title duplicate and kept eating the next heading too. Now only
+    # keeps stripping while the heading text actually matches the
+    # ORIGINAL first heading (the presumed cover title) — the exact shape
+    # of the confirmed "same title rendered twice" case this loop exists
+    # for — so a distinct, differently-worded heading stops it immediately.
     _COVER_TITLE_MAX_OFFSET = 50
-    while (
-        len(headings) >= 3
-        and headings[0][0] <= _COVER_TITLE_MAX_OFFSET
-    ):
-        headings = headings[1:]
+    if len(headings) >= 3:
+        _cover_title_norm = headings[0][1].strip().lower()
+        while (
+            len(headings) >= 3
+            and headings[0][0] <= _COVER_TITLE_MAX_OFFSET
+            and headings[0][1].strip().lower() == _cover_title_norm
+        ):
+            headings = headings[1:]
 
     return headings, subheadings
 
